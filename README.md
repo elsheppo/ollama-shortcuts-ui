@@ -19,27 +19,24 @@ The purpose of this project is to build a fully local workflow engine that allow
 - Python 3.7+
 - Git
 - Ollama installed on your local machine
-- Mac OS desktop or laptop computer with Shortcuts app (for full functionality)
+- Mac OS desktop or laptop computer with Shortcuts app
 
 ### Installation
 
 1. Clone the repository:
    ```
-   git clone https://github.com/yourusername/ollama-shortcuts-ui.git
+   git clone https://github.com/elsheppo/ollama-shortcuts-ui.git
    cd ollama-shortcuts-ui
    ```
 
-2. Install required Python packages:
-   ```
-   pip install -r requirements.txt
-   ```
-
-3. Run the local server:
+2. Run the local server:
    ```
    python webui.py
    ```
 
-4. Open your web browser and navigate to `http://localhost:8000`
+3. Open your web browser and navigate to `http://localhost:8000`
+
+4. That's it. Everything should run with a default Python installation.
 
 ## Usage
 
@@ -61,15 +58,14 @@ We welcome contributions to Ollama Shortcuts UI! Here's how you can help:
 
 ## Shortcuts Integration
 
-While we can't include Apple Shortcuts directly in this repository due to their proprietary format, we've created a collection of useful Shortcuts for OllamaShortcutsUI. You can download them from the following iCloud links:
+While we can't include Apple Shortcuts directly in this repository due to their proprietary format, we've created a starting block for you. Download it from the following iCloud link:
 
-- [Ollama Query Shortcut](https://www.icloud.com/shortcuts/your_shortcut_link_here)
-- [Workflow Step Executor](https://www.icloud.com/shortcuts/your_shortcut_link_here)
-- [Result Parser](https://www.icloud.com/shortcuts/your_shortcut_link_here)
+- [Ollama Shortcut, Basic Block](https://www.icloud.com/shortcuts/81d8876c3b964a93b553f47d23483f51)
 
-To use these Shortcuts:
+
+To use this Shortcut:
 1. Click on the links above on your Apple device
-2. Add the Shortcuts to your library
+2. Add the Shortcut to your library
 3. In the Ollama Shortcuts UI web interface, refresh your Shortcuts list to see the new additions
 
 ## Acknowledgments
