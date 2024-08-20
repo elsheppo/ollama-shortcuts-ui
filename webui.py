@@ -61,16 +61,16 @@ def save_workflow(workflow):
 def get_shortcuts():
     conn = sqlite3.connect('ollama_workflows.db')
     c = conn.cursor()
-    c.execute("SELECT * FROM shortcuts")
-    shortcuts = [{"id": row[0], "name": row[1], "description": row[2]} for row in c.fetchall()]
+    c.execute("SELECT name, description FROM shortcuts")
+    shortcuts = [{"name": row[0], "description": row[1]} for row in c.fetchall()]
     conn.close()
     return shortcuts
 
 def save_shortcut(shortcut):
     conn = sqlite3.connect('ollama_workflows.db')
     c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO shortcuts (id, name, description) VALUES (?, ?, ?)",
-              (shortcut['id'], shortcut['name'], shortcut['description']))
+    c.execute("INSERT OR REPLACE INTO shortcuts (name, description) VALUES (?, ?)",
+              (shortcut['name'], shortcut['description']))
     conn.commit()
     conn.close()
 
@@ -130,10 +130,10 @@ def refresh_shortcuts():
     conn.close()
     return user_shortcuts
 
-def update_shortcut_description(shortcut_id, description):
+def update_shortcut_description(shortcut_name, description):
     conn = sqlite3.connect('ollama_workflows.db')
     c = conn.cursor()
-    c.execute("UPDATE shortcuts SET description = ? WHERE id = ?", (description, shortcut_id))
+    c.execute("UPDATE shortcuts SET description = ? WHERE name = ?", (description, shortcut_name))
     conn.commit()
     conn.close()
 
@@ -189,37 +189,106 @@ async def run_shortcut(shortcut_name, input_json):
         return stdout.decode()
     finally:
         os.unlink(temp_file_path)
-
+        
 async def run_workflow(workflow, input_json, status_queue):
-    # Process knowledge structures
-    if 'context' in input_json and isinstance(input_json['context'], list):
-        processed_contexts = []
-        for context_item in input_json['context']:
-            if isinstance(context_item, dict) and 'id' in context_item:
-                structure_id = context_item['id']
-                full_structure = get_knowledge_structure(structure_id)
-                if full_structure:
-                    processed_contexts.append({
-                        "name": full_structure['name'],
-                        "content": full_structure['content'],
-                        "children": [{"name": child['name'], "content": child['content']} for child in full_structure.get('children', [])]
-                    })
-        input_json['context'] = processed_contexts
+    output_context = {}
+    branch_outputs = {}
+
+    def count_total_steps(steps):
+        total = 0
+        for step in steps:
+            if isinstance(step, dict) and step.get('type') == 'branch':
+                total += sum(len(branch) for branch in step['branches'])
+            else:
+                total += 1
+        return total
+
+    total_steps = count_total_steps(workflow['steps'])
+    current_step = 0
 
     for i, step in enumerate(workflow['steps']):
-        status_queue.put(json.dumps({"status": "running", "step": i + 1, "total": len(workflow['steps'])}))
+        if isinstance(step, dict) and step.get('type') == 'branch':
+            status_queue.put(json.dumps({"status": "running", "step": current_step + 1, "total": total_steps, "message": f"Starting parallel branch with {len(step['branches'])} branches"}))
+            
+            branch_tasks = []
+            for branch_index, branch in enumerate(step['branches']):
+                branch_input = {**input_json, 'previous_output': output_context.get('previous_output', '')}
+                branch_tasks.append(run_branch(branch, branch_input, status_queue, current_step, total_steps, branch_index))
+            
+            branch_results = await asyncio.gather(*branch_tasks)
+            branch_outputs[f"branch_{i}"] = {f"branch_{j}": result for j, result in enumerate(branch_results)}
+            
+            current_step += sum(len(branch) for branch in step['branches'])
+            status_queue.put(json.dumps({"status": "output", "step": current_step, "total": total_steps, "output": "Parallel branches completed"}))
         
-        # Handle prefilled prompts (keep existing code)
+        elif isinstance(step, dict) and step.get('type') == 'merge':
+            current_step += 1
+            status_queue.put(json.dumps({"status": "running", "step": current_step, "total": total_steps, "message": "Executing merge step"}))
+            
+            merge_input = {
+                **input_json,
+                'previous_output': output_context.get('previous_output', ''),
+                'branch_outputs': branch_outputs[f"branch_{step['branchStepIndex']}"]
+            }
+            try:
+                output = await run_shortcut(step['shortcutName'], merge_input)
+                output_context['previous_output'] = output
+                status_queue.put(json.dumps({"status": "output", "step": current_step, "total": total_steps, "output": output}))
+            except Exception as e:
+                status_queue.put(json.dumps({"status": "error", "step": current_step, "total": total_steps, "message": f"Error in merge step: {str(e)}"}))
+                raise
         
-        if isinstance(step, list):  # Parallel branch
-            tasks = [run_shortcut(s['name'], {**input_json, 'model': s.get('model')}) for s in step]
-            outputs = await asyncio.gather(*tasks)
-            status_queue.put(json.dumps({"status": "output", "step": i + 1, "output": outputs}))
         else:
-            output = await run_shortcut(step['name'], {**input_json, 'model': step.get('model')})
-            status_queue.put(json.dumps({"status": "output", "step": i + 1, "output": output}))
-        input_json['previous_output'] = output  # Pass output to next step
-    status_queue.put(json.dumps({"status": "completed"}))
+            current_step += 1
+            status_queue.put(json.dumps({"status": "running", "step": current_step, "total": total_steps, "message": f"Executing step: {step.get('name', 'Unnamed Step')}"}))
+            
+            input_for_step = {
+                **input_json,
+                'previous_output': output_context.get('previous_output', ''),
+                'model': step.get('model', input_json.get('model', '')),
+                'shortcut_name': step['shortcutName']
+            }
+            try:
+                output = await run_shortcut(step['shortcutName'], input_for_step)
+                output_context['previous_output'] = output
+                status_queue.put(json.dumps({"status": "output", "step": current_step, "total": total_steps, "output": output}))
+            except Exception as e:
+                status_queue.put(json.dumps({"status": "error", "step": current_step, "total": total_steps, "message": f"Error in step {step.get('name', 'Unnamed Step')}: {str(e)}"}))
+                raise
+
+    status_queue.put(json.dumps({"status": "completed", "total": total_steps}))
+    
+async def run_branch(branch_steps, input_json, status_queue, start_step, total_steps, branch_index):
+    output_context = {}
+    for i, step in enumerate(branch_steps):
+        current_step = start_step + i + 1
+        status_queue.put(json.dumps({
+            "status": "running", 
+            "step": current_step, 
+            "total": total_steps, 
+            "message": f"Executing branch {branch_index + 1}, step {i + 1}: {step.get('name', 'Unnamed Step')}"
+        }))
+        
+        input_for_step = {**input_json, 'previous_output': output_context.get('previous_output', '')}
+        try:
+            output = await run_shortcut(step['shortcutName'], input_for_step)
+            output_context['previous_output'] = output
+            status_queue.put(json.dumps({
+                "status": "output", 
+                "step": current_step, 
+                "total": total_steps, 
+                "output": output,
+                "message": f"Completed branch {branch_index + 1}, step {i + 1}"
+            }))
+        except Exception as e:
+            status_queue.put(json.dumps({
+                "status": "error", 
+                "step": current_step, 
+                "total": total_steps, 
+                "message": f"Error in branch {branch_index + 1}, step {i + 1}: {str(e)}"
+            }))
+            raise
+    return output_context['previous_output']
 
 def workflow_runner(workflow, input_json, status_queue):
     try:
@@ -240,6 +309,47 @@ HTML = """
     <style>
         .drag-item { cursor: move; }
         .drag-item.sortable-ghost { opacity: 0.4; }
+        .workflow-step {
+            margin-left: 20px;
+            border-left: 2px solid #4a5568;
+            padding-left: 10px;
+            position: relative;
+        }
+        .workflow-step::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -2px;
+            width: 10px;
+            height: 2px;
+            background-color: #4a5568;
+        }
+        .parallel-branch {
+            border: 2px solid #4a5568;
+            border-radius: 8px;
+            padding: 10px;
+            margin-bottom: 10px;
+        }
+        .parallel-branch::before {
+            content: 'Parallel Branch';
+            font-weight: bold;
+            display: block;
+            margin-bottom: 5px;
+            color: #4a5568;
+        }
+        .merge-step {
+            background-color: #faf089;
+            border: 2px solid #d69e2e;
+            border-radius: 8px;
+            padding: 10px;
+        }
+        .merge-step::before {
+            content: 'Merge';
+            font-weight: bold;
+            display: block;
+            margin-bottom: 5px;
+            color: #d69e2e;
+        }
     </style>
 </head>
 <body class="bg-gray-100">
@@ -276,7 +386,14 @@ HTML = """
             <input type="text" id="workflow-name" class="w-full p-2 mb-4 border rounded" placeholder="Workflow name">
             <div id="workflow-steps" class="mb-4 p-4 bg-white rounded shadow">
                 <h3 class="text-xl font-bold mb-2">Workflow Steps</h3>
-                <div id="step-list" class="space-y-2"></div>
+                <div id="step-list" class="space-y-2">
+                    <!-- Steps will be dynamically inserted here -->
+                </div>
+                <div class="mt-4 space-x-2">
+                    <button id="add-step" class="bg-blue-500 text-white px-4 py-2 rounded">Add Step</button>
+                    <button id="add-branch" class="bg-green-500 text-white px-4 py-2 rounded">Add Branch</button>
+                    <button id="add-merge" class="bg-yellow-500 text-white px-4 py-2 rounded">Add Merge</button>
+                </div>
             </div>
             <select id="shortcut-select" class="w-full p-2 mb-4 border rounded">
                 <option value="">Add step</option>
@@ -341,6 +458,14 @@ HTML = """
     </div>
 
     <script>
+        const WorkflowStepTypes = {
+            NORMAL: 'normal',
+            BRANCH: 'branch',
+            MERGE: 'merge'
+        };
+
+        let shortcuts = [];
+
         // Tab functionality
         const tabButtons = document.querySelectorAll('.tab-button');
         const tabContents = document.querySelectorAll('.tab-content');
@@ -358,79 +483,213 @@ HTML = """
         // Workflow functionality
         let currentWorkflow = { id: '', name: '', steps: [], form_definition: null };
 
+        function createStepElement(step, index, depth = 0) {
+            const stepElement = document.createElement('div');
+            stepElement.className = `workflow-step drag-item p-2 bg-gray-200 rounded flex flex-col justify-between items-stretch mb-2 ml-${depth * 4}`;
+            
+            if (step.type === WorkflowStepTypes.BRANCH) {
+                stepElement.className += ' parallel-branch';
+                stepElement.innerHTML = `
+                    <div class="branch-header mb-2">Parallel Branch (${step.branches.length} branches)</div>
+                    <div class="branch-container"></div>
+                    <button class="add-branch-step bg-blue-500 text-white px-2 py-1 rounded mt-2">Add Step to Branch</button>
+                `;
+                const branchContainer = stepElement.querySelector('.branch-container');
+                step.branches.forEach((branch, branchIndex) => {
+                    const branchElement = document.createElement('div');
+                    branchElement.className = 'branch mb-2 p-2 border border-gray-400 rounded';
+                    branchElement.innerHTML = `
+                        <div class="branch-label mb-2">Branch ${branchIndex + 1}</div>
+                        <div class="branch-steps"></div>
+                    `;
+                    const branchSteps = branchElement.querySelector('.branch-steps');
+                    branch.forEach((branchStep, stepIndex) => {
+                        branchSteps.appendChild(createStepContent(branchStep, `${index}-${branchIndex}-${stepIndex}`, `Branch ${branchIndex + 1} Step ${stepIndex + 1}`));
+                    });
+                    branchContainer.appendChild(branchElement);
+                });
+                
+                stepElement.querySelector('.add-branch-step').addEventListener('click', () => {
+                    const branchIndex = prompt(`Which branch do you want to add a step to? (1-${step.branches.length})`);
+                    if (branchIndex && branchIndex > 0 && branchIndex <= step.branches.length) {
+                        step.branches[branchIndex - 1].push({
+                            type: WorkflowStepTypes.NORMAL,
+                            name: `New Step in Branch ${branchIndex}`,
+                            shortcutName: '',
+                            model: ''
+                        });
+                        updateWorkflowDisplay();
+                    }
+                });
+            } else {
+                stepElement.appendChild(createStepContent(step, index, step.type === WorkflowStepTypes.MERGE ? 'Merge Step' : 'Step'));
+            }
+            
+            return stepElement;
+        }
+
+        function createStepContent(step, index, label) {
+            const content = document.createElement('div');
+            content.className = 'step-content';
+            content.innerHTML = `
+                <div class="flex justify-between items-center mb-2">
+                    <span>${label}: ${step.name}</span>
+                    <button class="remove-step bg-red-500 text-white px-2 py-1 rounded text-sm" data-index="${index}">Remove</button>
+                </div>
+                <div class="flex flex-col space-y-2">
+                    <select class="shortcut-select p-1 border rounded" data-step-index="${index}">
+                        <option value="">Select a shortcut</option>
+                        ${getShortcutOptions(step.shortcutName)}
+                    </select>
+                    <select class="model-select p-1 border rounded" data-step-index="${index}">
+                        <option value="">Select a model</option>
+                        ${getOllamaModelOptions(step.model)}
+                    </select>
+                </div>
+            `;
+
+            content.querySelector('.shortcut-select').addEventListener('change', function() {
+                updateStepData(index, 'shortcutName', this.value);
+            });
+
+            content.querySelector('.model-select').addEventListener('change', function() {
+                updateStepData(index, 'model', this.value);
+            });
+
+            content.querySelector('.remove-step').addEventListener('click', function() {
+                removeStep(this.getAttribute('data-index'));
+            });
+
+            return content;
+        }
+
+        function removeStep(index) {
+            const indices = index.split('-').map(Number);
+            if (indices.length === 1) {
+                currentWorkflow.steps.splice(indices[0], 1);
+            } else {
+                const [branchIndex, subBranchIndex, stepIndex] = indices;
+                currentWorkflow.steps[branchIndex].branches[subBranchIndex].splice(stepIndex, 1);
+                if (currentWorkflow.steps[branchIndex].branches[subBranchIndex].length === 0) {
+                    currentWorkflow.steps[branchIndex].branches.splice(subBranchIndex, 1);
+                }
+                if (currentWorkflow.steps[branchIndex].branches.length === 0) {
+                    currentWorkflow.steps.splice(branchIndex, 1);
+                }
+            }
+            updateWorkflowDisplay();
+        }
+
+        function getShortcutOptions(selectedShortcutName) {
+            if (!Array.isArray(shortcuts)) {
+                console.error('Shortcuts is not an array:', shortcuts);
+                return '';
+            }
+            return shortcuts.map(shortcut => 
+                `<option value="${shortcut.name}" ${shortcut.name === selectedShortcutName ? 'selected' : ''}>${shortcut.name}</option>`
+            ).join('');
+        }
+
+        function getOllamaModelOptions(selectedmodel) {
+            return ollamaModels.map(model => 
+                `<option value="${model}" ${model === selectedmodel ? 'selected' : ''}>${model}</option>`
+            ).join('');
+        }
+
         function updateWorkflowDisplay() {
             const stepList = document.getElementById('step-list');
             stepList.innerHTML = '';
+
             currentWorkflow.steps.forEach((step, index) => {
-                const stepElement = document.createElement('div');
-                stepElement.className = 'drag-item p-2 bg-gray-200 rounded flex justify-between items-center';
-                if (Array.isArray(step)) {
-                    stepElement.textContent = `Parallel Branch ${index + 1}`;
-                    const innerList = document.createElement('div');
-                    innerList.className = 'ml-4 space-y-2';
-                    step.forEach((parallelStep, parallelIndex) => {
-                        const parallelStepElement = document.createElement('div');
-                        parallelStepElement.className = 'drag-item p-2 bg-gray-100 rounded flex justify-between items-center';
-                        parallelStepElement.innerHTML = `
-                            ${parallelStep.name}
-                            <select class="model-select w-full p-2 mb-2 border rounded" data-step-index="${index}" data-parallel-index="${parallelIndex}">
-                                <option value="">Select a model</option>
-                                ${getOllamaModelOptions()}
-                            </select>
-                        `;
-                        if (parallelStep.model) {
-                            parallelStepElement.querySelector('.model-select').value = parallelStep.model;
-                        }
-                        const removeButton = createRemoveButton(() => {
-                            step.splice(parallelIndex, 1);
-                            if (step.length === 0) {
-                                currentWorkflow.steps.splice(index, 1);
-                            }
-                            updateWorkflowDisplay();
-                        });
-                        parallelStepElement.appendChild(removeButton);
-                        innerList.appendChild(parallelStepElement);
-                    });
-                    stepElement.appendChild(innerList);
-                } else {
-                    stepElement.innerHTML = `
-                        ${step.name}
-                        <select class="model-select w-full p-2 mb-2 border rounded" data-step-index="${index}">
-                            <option value="">Select a model</option>
-                            ${getOllamaModelOptions()}
-                        </select>
-                    `;
-                    if (step.model) {
-                        stepElement.querySelector('.model-select').value = step.model;
-                    }
-                }
-                const removeButton = createRemoveButton(() => {
-                    currentWorkflow.steps.splice(index, 1);
-                    updateWorkflowDisplay();
-                });
-                stepElement.appendChild(removeButton);
-                stepList.appendChild(stepElement);
+                stepList.appendChild(createStepElement(step, index));
             });
 
-            // Add event listeners for model selection
-            stepList.querySelectorAll('.model-select').forEach(select => {
+            // Add event listeners for shortcut and model selection changes
+            stepList.querySelectorAll('.shortcut-select, .model-select').forEach(select => {
                 select.addEventListener('change', (e) => {
-                    const stepIndex = parseInt(e.target.getAttribute('data-step-index'));
-                    const parallelIndex = e.target.hasAttribute('data-parallel-index') ? parseInt(e.target.getAttribute('data-parallel-index')) : null;
-                    
-                    if (parallelIndex !== null) {
-                        currentWorkflow.steps[stepIndex][parallelIndex].model = e.target.value;
-                    } else {
-                        currentWorkflow.steps[stepIndex].model = e.target.value;
-                    }
+                    const stepIndex = e.target.getAttribute('data-step-index');
+                    const isShortcut = e.target.classList.contains('shortcut-select');
+                    updateStepData(stepIndex, isShortcut ? 'shortcutName' : 'model', e.target.value);
                 });
             });
 
+            // Initialize drag-and-drop functionality
             new Sortable(stepList, {
                 animation: 150,
-                ghostClass: 'sortable-ghost'
+                ghostClass: 'sortable-ghost',
+                onEnd: function(evt) {
+                    const newIndex = evt.newIndex;
+                    const oldIndex = evt.oldIndex;
+                    const movedStep = currentWorkflow.steps.splice(oldIndex, 1)[0];
+                    currentWorkflow.steps.splice(newIndex, 0, movedStep);
+                    updateWorkflowDisplay();
+                }
             });
         }
+
+        function updateStepData(stepIndex, property, value) {
+            const indices = typeof stepIndex === 'string' ? stepIndex.split('-').map(Number) : [stepIndex];
+            let step = currentWorkflow.steps[indices[0]];
+            if (indices.length > 1) { // It's a step within a branch
+                step = step.branches[indices[1]][indices[2]];
+            }
+            step[property] = value;
+        }
+
+        function addNormalStep() {
+            const stepName = prompt("Enter step name:");
+            if (stepName) {
+                currentWorkflow.steps.push({ 
+                    type: WorkflowStepTypes.NORMAL, 
+                    name: stepName,
+                    shortcutName: '',
+                    model: ''
+                });
+                updateWorkflowDisplay();
+            }
+        }
+
+        function addBranchStep() {
+            const branchCount = prompt("How many branches do you want to create?", "2");
+            const count = parseInt(branchCount);
+            if (isNaN(count) || count < 2) {
+                alert("Please enter a valid number of branches (2 or more)");
+                return;
+            }
+            
+            const newBranch = {
+                type: WorkflowStepTypes.BRANCH,
+                branches: Array(count).fill().map(() => [])
+            };
+            
+            currentWorkflow.steps.push(newBranch);
+            updateWorkflowDisplay();
+        }
+
+
+        function addMergeStep() {
+            const mergeName = prompt("Enter merge step name:");
+            if (mergeName) {
+                const lastBranchIndex = currentWorkflow.steps.map(step => step.type).lastIndexOf(WorkflowStepTypes.BRANCH);
+                if (lastBranchIndex !== -1) {
+                    currentWorkflow.steps.push({ 
+                        type: WorkflowStepTypes.MERGE, 
+                        name: mergeName, 
+                        branchStepIndex: lastBranchIndex,
+                        shortcutName: '',
+                        model: ''
+                    });
+                    updateWorkflowDisplay();
+                } else {
+                    alert("You need to add a branch step before adding a merge step.");
+                }
+            }
+        }
+
+        // Event listeners for the add step buttons
+        document.getElementById('add-step').addEventListener('click', addNormalStep);
+        document.getElementById('add-branch').addEventListener('click', addBranchStep);
+        document.getElementById('add-merge').addEventListener('click', addMergeStep);
 
         function createRemoveButton(onClick) {
             const button = document.createElement('button');
@@ -526,44 +785,43 @@ HTML = """
             formContainer.appendChild(addButton);
         }
 
-        document.getElementById('run-workflow').addEventListener('click', () => {
-            const workflowId = currentWorkflow.id;
-            const inputJson = {};
-            const formElement = document.getElementById('workflow-form');
-            if (formElement) {
-                const formData = new FormData(formElement);
-                Object.assign(inputJson, Object.fromEntries(formData));
-            }
-            inputJson.user_input = document.getElementById('workflow-input').value;
-            inputJson.steps = currentWorkflow.steps; // Include the steps with model information
-            runWorkflow(workflowId, inputJson);
-        });
-
         function runWorkflow(workflowId, inputJson) {
             console.log('Running workflow:', workflowId);
             console.log('Input JSON:', inputJson);
 
             const statusElement = document.getElementById('workflow-status');
-            if (!statusElement) {
-                console.error('Workflow status element not found');
-                alert('Error: Workflow status element not found. Please refresh the page and try again.');
-                return;
-            }
-
             const progressBar = statusElement.querySelector('.progress-bar-fill');
             const statusText = statusElement.querySelector('.status-text');
             const stepOutputs = statusElement.querySelector('.step-outputs');
-
-            if (!progressBar || !statusText || !stepOutputs) {
-                console.error('One or more required elements not found in the workflow status');
-                alert('Error: Some required elements are missing. Please refresh the page and try again.');
-                return;
-            }
 
             statusElement.style.display = 'block';
             progressBar.style.width = '0%';
             statusText.textContent = 'Initializing workflow...';
             stepOutputs.innerHTML = '';
+
+            // Collect all form data
+            const formData = {};
+            const formElement = document.getElementById(`workflow-form-${workflowId}`);
+            if (formElement) {
+                formElement.querySelectorAll('input, select, textarea').forEach(element => {
+                    if (element.type === 'select-multiple') {
+                        formData[element.name] = Array.from(element.selectedOptions).map(option => ({
+                            id: option.value,
+                            name: option.textContent
+                        }));
+                    } else {
+                        formData[element.name] = element.value;
+                    }
+                });
+            }
+
+            // Combine all input data
+            const completeInputJson = {
+                ...inputJson,
+                ...formData,
+                model: document.querySelector('.model-select').value, // Ensure model is always included
+                workflow_steps: currentWorkflow.steps
+            };
 
             const eventSource = new EventSource(`/run-workflow/${workflowId}?input=${encodeURIComponent(JSON.stringify(inputJson))}`);
 
@@ -578,8 +836,7 @@ HTML = """
                     outputElement.className = 'mb-4 p-4 bg-gray-100 rounded';
                     outputElement.innerHTML = `
                         <h4 class="font-bold mb-2">Step ${data.step} Output:</h4>
-                        <div class="whitespace-pre-wrap">${typeof marked === 'function' ? marked(data.output) : data.output}</div>
-                        <button class="copy-output mt-2 bg-gray-500 text-white px-2 py-1 rounded text-sm" data-output="${data.output}">Copy to Clipboard</button>
+                        <pre class="whitespace-pre-wrap">${data.output}</pre>
                     `;
                     stepOutputs.appendChild(outputElement);
                 } else if (data.status === 'completed') {
@@ -595,6 +852,26 @@ HTML = """
                 eventSource.close();
             };
         }
+
+        // Event listener for running the workflow
+        document.getElementById('run-workflow').addEventListener('click', () => {
+            const workflowId = currentWorkflow.id;
+            const inputJson = {
+                workflow_steps: currentWorkflow.steps,
+                user_input: document.getElementById('workflow-input').value
+            };
+            
+            // Add form data if exists
+            const formElement = document.getElementById('workflow-form');
+            if (formElement) {
+                const formData = new FormData(formElement);
+                for (let [key, value] of formData.entries()) {
+                    inputJson[key] = value;
+                }
+            }
+            
+            runWorkflow(workflowId, inputJson);
+        });
 
         document.getElementById('shortcut-select').addEventListener('change', (e) => {
             if (e.target.value) {
@@ -770,27 +1047,29 @@ HTML = """
             }
         });
 
-        function loadShortcuts() {
-            fetch('/shortcuts')
-                .then(response => response.json())
-                .then(data => {
-                    const shortcutSelect = document.getElementById('shortcut-select');
-                    const shortcutDropdown = document.getElementById('shortcut-dropdown');
-                    shortcutSelect.innerHTML = '<option value="">Add step</option>';
-                    shortcutDropdown.innerHTML = '<option value="">Select a shortcut</option>';
-                    data.forEach(shortcut => {
-                        const option = document.createElement('option');
-                        option.value = JSON.stringify(shortcut);
-                        option.textContent = shortcut.name;
-                        shortcutSelect.appendChild(option.cloneNode(true));
-                        shortcutDropdown.appendChild(option);
+            function loadShortcuts() {
+                fetch('/shortcuts')
+                    .then(response => response.json())
+                    .then(data => {
+                        shortcuts = data;
+                        const shortcutSelect = document.getElementById('shortcut-select');
+                        const shortcutDropdown = document.getElementById('shortcut-dropdown');
+                        shortcutSelect.innerHTML = '<option value="">Add step</option>';
+                        shortcutDropdown.innerHTML = '<option value="">Select a shortcut</option>';
+                        data.forEach(shortcut => {
+                            const option = document.createElement('option');
+                            option.value = JSON.stringify(shortcut);
+                            option.textContent = shortcut.name;
+                            shortcutSelect.appendChild(option.cloneNode(true));
+                            shortcutDropdown.appendChild(option);
+                        });
+                        updateWorkflowDisplay();
+                    })
+                    .catch(error => {
+                        console.error('Error:', error);
+                        alert('Failed to load shortcuts. Please try again.');
                     });
-                })
-                .catch(error => {
-                    console.error('Error:', error);
-                    alert('Failed to load shortcuts. Please try again.');
-                });
-        }
+            }
 
         document.getElementById('shortcut-dropdown').addEventListener('change', (e) => {
             if (e.target.value) {
@@ -804,12 +1083,12 @@ HTML = """
         });
 
         document.getElementById('update-description').addEventListener('click', () => {
-            const shortcutId = JSON.parse(document.getElementById('shortcut-dropdown').value).id;
+            const shortcutName = JSON.parse(document.getElementById('shortcut-dropdown').value).id;
             const description = document.getElementById('shortcut-description').value;
             fetch('/update-shortcut-description', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ id: shortcutId, description: description })
+                body: JSON.stringify({ id: shortcutName, description: description })
             })
             .then(response => response.json())
             .then(data => {
@@ -1208,8 +1487,8 @@ HTML = """
 
         document.addEventListener('DOMContentLoaded', function() {
             function init() {
-                loadWorkflows();
                 loadShortcuts();
+                loadWorkflows();
                 loadKnowledgeStructures();
                 // Set dashboard as the initial active tab
                 document.querySelector('[data-tab="dashboard"]').click();
@@ -1353,7 +1632,7 @@ class OllamaHandler(BaseHTTPRequestHandler):
                 self.wfile.write(json.dumps({"error": "Failed to refresh shortcuts"}).encode())
         elif self.path == '/update-shortcut-description':
             try:
-                update_shortcut_description(data['id'], data['description'])
+                update_shortcut_description(data['name'], data['description'])
                 self.wfile.write(json.dumps({"message": "Shortcut description updated successfully"}).encode())
             except Exception as e:
                 logging.error(f"Error updating shortcut description: {str(e)}")
