@@ -24,12 +24,18 @@ def init_db():
                  (id TEXT PRIMARY KEY, name TEXT, description TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS knowledge_structures
                  (id TEXT PRIMARY KEY, name TEXT, content TEXT, parent_id TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS user_prompts
+                 (id TEXT PRIMARY KEY, name TEXT, content TEXT)''')
     
     # Add form_definition column if it doesn't exist
     c.execute("PRAGMA table_info(workflows)")
     columns = [column[1] for column in c.fetchall()]
     if 'form_definition' not in columns:
         c.execute("ALTER TABLE workflows ADD COLUMN form_definition TEXT")
+
+    # Add user_prompts column if it doesn't exist
+    if 'user_prompts' not in columns:
+        c.execute("ALTER TABLE workflows ADD COLUMN user_prompts TEXT")
     
     conn.commit()
     conn.close()
@@ -45,8 +51,10 @@ def get_workflows():
 def save_workflow(workflow):
     conn = sqlite3.connect('ollama_workflows.db')
     c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO workflows (id, name, steps, form_definition) VALUES (?, ?, ?, ?)",
-              (workflow['id'], workflow['name'], json.dumps(workflow['steps']), json.dumps(workflow.get('form_definition'))))
+    c.execute("INSERT OR REPLACE INTO workflows (id, name, steps, form_definition, user_prompts) VALUES (?, ?, ?, ?, ?)",
+              (workflow['id'], workflow['name'], json.dumps(workflow['steps']), 
+               json.dumps(workflow.get('form_definition')), 
+               json.dumps(workflow.get('user_prompts', []))))
     conn.commit()
     conn.close()
 
@@ -79,9 +87,15 @@ def get_knowledge_structure(structure_id):
     c = conn.cursor()
     c.execute("SELECT * FROM knowledge_structures WHERE id = ?", (structure_id,))
     row = c.fetchone()
-    conn.close()
     if row:
-        return {"id": row[0], "name": row[1], "content": row[2], "parent_id": row[3]}
+        structure = {"id": row[0], "name": row[1], "content": row[2], "parent_id": row[3]}
+        # Fetch child structures
+        c.execute("SELECT * FROM knowledge_structures WHERE parent_id = ?", (structure_id,))
+        children = [{"id": r[0], "name": r[1], "content": r[2], "parent_id": r[3]} for r in c.fetchall()]
+        structure["children"] = children
+        conn.close()
+        return structure
+    conn.close()
     return None
 
 def save_knowledge_structure(structure):
@@ -123,6 +137,35 @@ def update_shortcut_description(shortcut_id, description):
     conn.commit()
     conn.close()
 
+def save_user_prompt(prompt):
+    conn = sqlite3.connect('ollama_workflows.db')
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO user_prompts (id, name, content) VALUES (?, ?, ?)",
+              (prompt['id'], prompt['name'], prompt['content']))
+    conn.commit()
+    conn.close()
+
+def get_user_prompts():
+    conn = sqlite3.connect('ollama_workflows.db')
+    c = conn.cursor()
+    c.execute("SELECT * FROM user_prompts")
+    prompts = [{"id": row[0], "name": row[1], "content": row[2]} for row in c.fetchall()]
+    conn.close()
+    return prompts
+
+def get_ollama_models():
+    try:
+        result = subprocess.run(['ollama', 'list'], capture_output=True, text=True)
+        if result.returncode == 0:
+            models = result.stdout.strip().split('\n')
+            return [model.split()[0] for model in models if model]
+        else:
+            logging.error(f"Failed to fetch Ollama models: {result.stderr}")
+            return []
+    except Exception as e:
+        logging.error(f"Error fetching Ollama models: {str(e)}")
+        return []
+
 # Initialize shortcuts on startup
 def init_shortcuts():
     if not get_shortcuts():
@@ -151,28 +194,29 @@ async def run_workflow(workflow, input_json, status_queue):
     # Process knowledge structures
     if 'context' in input_json and isinstance(input_json['context'], list):
         processed_contexts = []
-        for structure in input_json['context']:
-            if 'id' in structure:
-                # Fetch the full content of the knowledge structure
-                full_structure = get_knowledge_structure(structure['id'])
-                if full_structure and 'content' in full_structure:
-                    processed_contexts.append(full_structure['content'])
-                else:
-                    logging.warning(f"Content not found for knowledge structure with id: {structure['id']}")
-            elif 'content' in structure:
-                processed_contexts.append(structure['content'])
-            else:
-                logging.warning(f"Invalid knowledge structure format: {structure}")
+        for context_item in input_json['context']:
+            if isinstance(context_item, dict) and 'id' in context_item:
+                structure_id = context_item['id']
+                full_structure = get_knowledge_structure(structure_id)
+                if full_structure:
+                    processed_contexts.append({
+                        "name": full_structure['name'],
+                        "content": full_structure['content'],
+                        "children": [{"name": child['name'], "content": child['content']} for child in full_structure.get('children', [])]
+                    })
         input_json['context'] = processed_contexts
 
     for i, step in enumerate(workflow['steps']):
         status_queue.put(json.dumps({"status": "running", "step": i + 1, "total": len(workflow['steps'])}))
+        
+        # Handle prefilled prompts (keep existing code)
+        
         if isinstance(step, list):  # Parallel branch
-            tasks = [run_shortcut(s['name'], input_json) for s in step]
+            tasks = [run_shortcut(s['name'], {**input_json, 'model': s.get('model')}) for s in step]
             outputs = await asyncio.gather(*tasks)
             status_queue.put(json.dumps({"status": "output", "step": i + 1, "output": outputs}))
         else:
-            output = await run_shortcut(step['name'], input_json)
+            output = await run_shortcut(step['name'], {**input_json, 'model': step.get('model')})
             status_queue.put(json.dumps({"status": "output", "step": i + 1, "output": output}))
         input_json['previous_output'] = output  # Pass output to next step
     status_queue.put(json.dumps({"status": "completed"}))
@@ -327,7 +371,16 @@ HTML = """
                     step.forEach((parallelStep, parallelIndex) => {
                         const parallelStepElement = document.createElement('div');
                         parallelStepElement.className = 'drag-item p-2 bg-gray-100 rounded flex justify-between items-center';
-                        parallelStepElement.textContent = parallelStep.name;
+                        parallelStepElement.innerHTML = `
+                            ${parallelStep.name}
+                            <select class="model-select w-full p-2 mb-2 border rounded" data-step-index="${index}" data-parallel-index="${parallelIndex}">
+                                <option value="">Select a model</option>
+                                ${getOllamaModelOptions()}
+                            </select>
+                        `;
+                        if (parallelStep.model) {
+                            parallelStepElement.querySelector('.model-select').value = parallelStep.model;
+                        }
                         const removeButton = createRemoveButton(() => {
                             step.splice(parallelIndex, 1);
                             if (step.length === 0) {
@@ -340,7 +393,16 @@ HTML = """
                     });
                     stepElement.appendChild(innerList);
                 } else {
-                    stepElement.textContent = step.name;
+                    stepElement.innerHTML = `
+                        ${step.name}
+                        <select class="model-select w-full p-2 mb-2 border rounded" data-step-index="${index}">
+                            <option value="">Select a model</option>
+                            ${getOllamaModelOptions()}
+                        </select>
+                    `;
+                    if (step.model) {
+                        stepElement.querySelector('.model-select').value = step.model;
+                    }
                 }
                 const removeButton = createRemoveButton(() => {
                     currentWorkflow.steps.splice(index, 1);
@@ -349,6 +411,21 @@ HTML = """
                 stepElement.appendChild(removeButton);
                 stepList.appendChild(stepElement);
             });
+
+            // Add event listeners for model selection
+            stepList.querySelectorAll('.model-select').forEach(select => {
+                select.addEventListener('change', (e) => {
+                    const stepIndex = parseInt(e.target.getAttribute('data-step-index'));
+                    const parallelIndex = e.target.hasAttribute('data-parallel-index') ? parseInt(e.target.getAttribute('data-parallel-index')) : null;
+                    
+                    if (parallelIndex !== null) {
+                        currentWorkflow.steps[stepIndex][parallelIndex].model = e.target.value;
+                    } else {
+                        currentWorkflow.steps[stepIndex].model = e.target.value;
+                    }
+                });
+            });
+
             new Sortable(stepList, {
                 animation: 150,
                 ghostClass: 'sortable-ghost'
@@ -369,7 +446,8 @@ HTML = """
                     .then(response => response.json())
                     .then(data => {
                         currentWorkflow = data;
-                        document.getElementById('workflow-name').value = currentWorkflow.name;
+                        currentWorkflow.form_definition = currentWorkflow.form_definition || [];
+                        document.getElementById('workflow-name').value = currentWorkflow.name || '';
                         updateWorkflowDisplay();
                         updateWorkflowForm();
                     })
@@ -378,7 +456,7 @@ HTML = """
                         alert('Failed to load workflow. Please try again.');
                     });
             } else {
-                currentWorkflow = { id: '', name: '', steps: [], form_definition: null };
+                currentWorkflow = { id: '', name: 'New Workflow', steps: [], form_definition: [] };
                 document.getElementById('workflow-name').value = '';
                 updateWorkflowDisplay();
                 updateWorkflowForm();
@@ -388,57 +466,76 @@ HTML = """
         function updateWorkflowForm() {
             const formContainer = document.getElementById('workflow-form');
             formContainer.innerHTML = '';
-            if (currentWorkflow.form_definition) {
-                currentWorkflow.form_definition.forEach(field => {
-                    const fieldElement = document.createElement('div');
-                    fieldElement.className = 'mb-2';
-                    let inputElement;
-                    switch (field.type) {
-                        case 'text':
-                        case 'number':
-                            inputElement = document.createElement('input');
-                            inputElement.type = field.type;
-                            break;
-                        case 'textarea':
-                            inputElement = document.createElement('textarea');
-                            break;
-                        case 'select':
-                            inputElement = document.createElement('select');
-                            field.options.forEach(option => {
-                                const optionElement = document.createElement('option');
-                                optionElement.value = option;
-                                optionElement.textContent = option;
-                                inputElement.appendChild(optionElement);
-                            });
-                            break;
-                        case 'knowledge-structure':
-                            inputElement = document.createElement('select');
-                            inputElement.multiple = true;
-                            fetchKnowledgeStructures().then(structures => {
-                                structures.forEach(structure => {
-                                    const optionElement = document.createElement('option');
-                                    optionElement.value = structure.id;
-                                    optionElement.textContent = structure.name;
-                                    optionElement.dataset.content = structure.content; // Store content in data attribute
-                                    inputElement.appendChild(optionElement);
-                                });
-                            });
-                            break;
+
+            if (currentWorkflow && currentWorkflow.form_definition) {
+                currentWorkflow.form_definition.forEach((field, index) => {
+                    if (field && typeof field === 'object') {
+                        const fieldDiv = document.createElement('div');
+                        fieldDiv.className = 'form-field';
+
+                        const label = document.createElement('label');
+                        label.textContent = field.label || `Field ${index + 1}`;
+                        fieldDiv.appendChild(label);
+
+                        let input;
+                        switch (field.type) {
+                            case 'textarea':
+                                input = document.createElement('textarea');
+                                break;
+                            case 'select':
+                                input = document.createElement('select');
+                                if (Array.isArray(field.options)) {
+                                    field.options.forEach(option => {
+                                        const optionElement = document.createElement('option');
+                                        optionElement.value = option;
+                                        optionElement.textContent = option;
+                                        input.appendChild(optionElement);
+                                    });
+                                }
+                                break;
+                            default:
+                                input = document.createElement('input');
+                                input.type = field.type || 'text';
+                        }
+
+                        input.name = field.name || `field_${index}`;
+                        input.id = `form_${input.name}`;
+                        fieldDiv.appendChild(input);
+
+                        const removeButton = createRemoveButton(() => {
+                            currentWorkflow.form_definition.splice(index, 1);
+                            updateWorkflowForm();
+                        });
+                        fieldDiv.appendChild(removeButton);
+
+                        formContainer.appendChild(fieldDiv);
                     }
-                    inputElement.name = field.name;
-                    inputElement.className = 'w-full p-2 border rounded';
-                    inputElement.placeholder = field.label;
-                    fieldElement.appendChild(inputElement);
-                    formContainer.appendChild(fieldElement);
                 });
             }
+
+            // Add new field button
+            const addButton = document.createElement('button');
+            addButton.textContent = 'Add Field';
+            addButton.onclick = () => {
+                if (!currentWorkflow.form_definition) {
+                    currentWorkflow.form_definition = [];
+                }
+                currentWorkflow.form_definition.push({ type: 'text', label: '', name: '' });
+                updateWorkflowForm();
+            };
+            formContainer.appendChild(addButton);
         }
 
         document.getElementById('run-workflow').addEventListener('click', () => {
             const workflowId = currentWorkflow.id;
-            const formData = new FormData(document.getElementById('workflow-form'));
-            const inputJson = Object.fromEntries(formData);
+            const inputJson = {};
+            const formElement = document.getElementById('workflow-form');
+            if (formElement) {
+                const formData = new FormData(formElement);
+                Object.assign(inputJson, Object.fromEntries(formData));
+            }
             inputJson.user_input = document.getElementById('workflow-input').value;
+            inputJson.steps = currentWorkflow.steps; // Include the steps with model information
             runWorkflow(workflowId, inputJson);
         });
 
@@ -593,18 +690,24 @@ HTML = """
                         inputElement = document.createElement('textarea');
                         break;
                     case 'select':
+                    case 'dropdown':
                         inputElement = document.createElement('select');
-                        field.options.forEach(option => {
-                            const optionElement = document.createElement('option');
-                            optionElement.value = option;
-                            optionElement.textContent = option;
-                            inputElement.appendChild(optionElement);
-                        });
+                        if (Array.isArray(field.options)) {
+                            field.options.forEach(option => {
+                                const optionElement = document.createElement('option');
+                                optionElement.value = option;
+                                optionElement.textContent = option;
+                                if (field.type === 'dropdown' && option === field.default) {
+                                    optionElement.selected = true;
+                                }
+                                inputElement.appendChild(optionElement);
+                            });
+                        }
                         break;
                     case 'knowledge-structure':
                         inputElement = document.createElement('select');
                         inputElement.multiple = true;
-                        // We need to populate this with actual knowledge structures
+                        // Populate with knowledge structures
                         fetchKnowledgeStructures().then(structures => {
                             structures.forEach(structure => {
                                 const optionElement = document.createElement('option');
@@ -626,6 +729,7 @@ HTML = """
                 formContainer.appendChild(fieldElement);
             });
         }
+
 
         function fetchKnowledgeStructures() {
             return fetch('/knowledge-structures')
@@ -825,7 +929,7 @@ HTML = """
                 .then(response => response.json())
                 .then(data => {
                     statusText.textContent = 'Shortcut completed';
-                    outputElement.innerHTML = marked(data.result);
+                    outputElement.textContent = data.result;
                     // Make sure the output is visible
                     outputElement.style.display = 'block';
                 })
@@ -861,21 +965,30 @@ HTML = """
         // Form Builder functionality
         let currentForm = [];
 
-        document.getElementById('form-workflow-select').addEventListener('change', (e) => {
+        document.getElementById('workflow-select').addEventListener('change', (e) => {
             if (e.target.value) {
                 fetch(`/get-workflow/${e.target.value}`)
                     .then(response => response.json())
                     .then(data => {
-                        currentForm = data.form_definition || [];
-                        updateFormBuilder();
+                        currentWorkflow = {
+                            id: data.id || '',
+                            name: data.name || 'Unnamed Workflow',
+                            steps: data.steps || [],
+                            form_definition: data.form_definition || []
+                        };
+                        document.getElementById('workflow-name').value = currentWorkflow.name;
+                        updateWorkflowDisplay();
+                        updateWorkflowForm();
                     })
                     .catch(error => {
                         console.error('Error:', error);
-                        alert('Failed to load workflow form. Please try again.');
+                        alert('Failed to load workflow. Please try again.');
                     });
             } else {
-                currentForm = [];
-                updateFormBuilder();
+                currentWorkflow = { id: '', name: 'New Workflow', steps: [], form_definition: [] };
+                document.getElementById('workflow-name').value = currentWorkflow.name;
+                updateWorkflowDisplay();
+                updateWorkflowForm();
             }
         });
 
@@ -887,20 +1000,51 @@ HTML = """
                 fieldElement.className = 'p-4 bg-white rounded shadow mb-4';
                 fieldElement.innerHTML = `
                     <input type="text" class="w-full p-2 mb-2 border rounded" value="${field.label}" placeholder="Field Label">
-                    <select class="w-full p-2 mb-2 border rounded">
+                    <select class="w-full p-2 mb-2 border rounded field-type-select">
                         <option value="text" ${field.type === 'text' ? 'selected' : ''}>Text</option>
                         <option value="number" ${field.type === 'number' ? 'selected' : ''}>Number</option>
                         <option value="textarea" ${field.type === 'textarea' ? 'selected' : ''}>Textarea</option>
                         <option value="select" ${field.type === 'select' ? 'selected' : ''}>Select</option>
+                        <option value="dropdown" ${field.type === 'dropdown' ? 'selected' : ''}>Dropdown</option>
                         <option value="knowledge-structure" ${field.type === 'knowledge-structure' ? 'selected' : ''}>Knowledge Structure</option>
                     </select>
                     <input type="text" class="w-full p-2 mb-2 border rounded" value="${field.name}" placeholder="Field Name">
-                    ${field.type === 'select' ? `<input type="text" class="w-full p-2 mb-2 border rounded" value="${field.options.join(',')}" placeholder="Options (comma-separated)">` : ''}
+                    ${field.type === 'select' || field.type === 'dropdown' ? `<input type="text" class="w-full p-2 mb-2 border rounded options-input" value="${field.options ? field.options.join(',') : ''}" placeholder="Options (comma-separated)">` : ''}
+                    ${field.type === 'dropdown' ? `<input type="text" class="w-full p-2 mb-2 border rounded" value="${field.default || ''}" placeholder="Default Value">` : ''}
                     <button class="remove-field bg-red-500 text-white px-2 py-1 rounded" data-index="${index}">Remove</button>
                 `;
                 formFields.appendChild(fieldElement);
             });
         }
+
+
+        document.getElementById('form-fields').addEventListener('change', (e) => {
+            if (e.target.classList.contains('field-type-select')) {
+                const fieldElement = e.target.closest('div');
+                const optionsInput = fieldElement.querySelector('.options-input');
+                const defaultValueInput = fieldElement.querySelector('input[placeholder="Default Value"]');
+                
+                if (e.target.value === 'select' || e.target.value === 'dropdown') {
+                    if (!optionsInput) {
+                        const newOptionsInput = document.createElement('input');
+                        newOptionsInput.type = 'text';
+                        newOptionsInput.className = 'w-full p-2 mb-2 border rounded options-input';
+                        newOptionsInput.placeholder = 'Options (comma-separated)';
+                        e.target.insertAdjacentElement('afterend', newOptionsInput);
+                    }
+                    if (e.target.value === 'dropdown' && !defaultValueInput) {
+                        const newDefaultValueInput = document.createElement('input');
+                        newDefaultValueInput.type = 'text';
+                        newDefaultValueInput.className = 'w-full p-2 mb-2 border rounded';
+                        newDefaultValueInput.placeholder = 'Default Value';
+                        fieldElement.insertBefore(newDefaultValueInput, fieldElement.lastElementChild);
+                    }
+                } else {
+                    if (optionsInput) optionsInput.remove();
+                    if (defaultValueInput) defaultValueInput.remove();
+                }
+            }
+        });
 
         document.getElementById('add-form-field').addEventListener('click', () => {
             currentForm.push({ label: '', type: 'text', name: '' });
@@ -923,8 +1067,9 @@ HTML = """
                     const label = field.querySelector('input[placeholder="Field Label"]').value;
                     const type = field.querySelector('select').value;
                     const name = field.querySelector('input[placeholder="Field Name"]').value;
-                    const options = type === 'select' ? field.querySelector('input[placeholder="Options (comma-separated)"]').value.split(',') : undefined;
-                    return { label, type, name, options };
+                    const options = type === 'select' || type === 'dropdown' ? field.querySelector('input[placeholder="Options (comma-separated)"]').value.split(',').map(opt => opt.trim()) : undefined;
+                    const defaultValue = type === 'dropdown' ? field.querySelector('input[placeholder="Default Value"]').value : undefined;
+                    return { label, type, name, options, default: defaultValue };
                 });
                 fetch(`/save-form/${workflowId}`, {
                     method: 'POST',
@@ -1024,6 +1169,24 @@ HTML = """
                 }
             }
         });
+
+        function getOllamaModelOptions() {
+            return ollamaModels.map(model => `<option value="${model}">${model}</option>`).join('');
+        }
+
+        let ollamaModels = [];
+        fetch('/ollama-models')
+            .then(response => response.json())
+            .then(data => {
+                ollamaModels = data;
+                updateWorkflowDisplay();
+            })
+            .catch(error => {
+                console.error('Error fetching Ollama models:', error);
+                ollamaModels = ['Error fetching models'];
+                updateWorkflowDisplay();
+            });
+
 
         // Settings functionality
         document.getElementById('save-settings').addEventListener('click', () => {
@@ -1129,6 +1292,12 @@ class OllamaHandler(BaseHTTPRequestHandler):
                 self.send_header('Content-type', 'application/json')
                 self.end_headers()
                 self.wfile.write(json.dumps({"error": str(e)}).encode())
+        elif self.path == '/ollama-models':
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            models = get_ollama_models()
+            self.wfile.write(json.dumps(models).encode())
         else:
             self.send_response(200)
             self.send_header('Content-type', 'text/html')
@@ -1163,6 +1332,10 @@ class OllamaHandler(BaseHTTPRequestHandler):
             try:
                 workflow = next((w for w in get_workflows() if w['id'] == workflow_id), None)
                 if workflow:
+                    for field in data:
+                        if field['type'] in ['select', 'dropdown']:
+                            field['options'] = field['options'].split(',') if isinstance(field['options'], str) else field['options']
+                            field['default'] = field.get('default', '')
                     workflow['form_definition'] = data
                     save_workflow(workflow)
                     self.wfile.write(json.dumps({"message": "Form saved successfully"}).encode())
