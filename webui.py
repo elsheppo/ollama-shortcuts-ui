@@ -153,6 +153,21 @@ def get_user_prompts():
     conn.close()
     return prompts
 
+def get_user_prompt(prompt_id):
+    conn = sqlite3.connect('ollama_workflows.db')
+    c = conn.cursor()
+    c.execute("SELECT * FROM user_prompts WHERE id = ?", (prompt_id,))
+    prompt = c.fetchone()
+    conn.close()
+    return {"id": prompt[0], "name": prompt[1], "content": prompt[2]} if prompt else None
+
+def delete_user_prompt(prompt_id):
+    conn = sqlite3.connect('ollama_workflows.db')
+    c = conn.cursor()
+    c.execute("DELETE FROM user_prompts WHERE id = ?", (prompt_id,))
+    conn.commit()
+    conn.close()
+
 def get_ollama_models():
     try:
         result = subprocess.run(['ollama', 'list'], capture_output=True, text=True)
@@ -248,6 +263,12 @@ async def run_workflow(workflow, input_json, status_queue):
                 'model': step.get('model', input_json.get('model', '')),
                 'shortcut_name': step['shortcutName']
             }
+
+            if step.get('userPromptId'):
+                user_prompt = get_user_prompt(step['userPromptId'])
+                if user_prompt:
+                    input_for_step['user_prompt'] = user_prompt['content']
+
             try:
                 output = await run_shortcut(step['shortcutName'], input_for_step)
                 output_context['previous_output'] = output
@@ -362,6 +383,7 @@ HTML = """
             <button class="tab-button bg-blue-500 text-white px-4 py-2 rounded" data-tab="shortcuts">Shortcuts</button>
             <button class="tab-button bg-blue-500 text-white px-4 py-2 rounded" data-tab="formbuilder">Form Builder</button>
             <button class="tab-button bg-blue-500 text-white px-4 py-2 rounded" data-tab="context">Context Manager</button>
+            <button class="tab-button bg-blue-500 text-white px-4 py-2 rounded" data-tab="user-prompts">User Prompts</button>
             <button class="tab-button bg-blue-500 text-white px-4 py-2 rounded" data-tab="settings">Settings</button>
         </div>
 
@@ -449,6 +471,14 @@ HTML = """
             <button id="add-knowledge-structure" class="bg-green-500 text-white px-4 py-2 rounded">Add Knowledge Structure</button>
         </div>
 
+        <div id="user-prompts" class="tab-content">
+            <h2 class="text-2xl font-bold mb-4">User Prompts</h2>
+            <div id="user-prompt-list" class="mb-4 space-y-2"></div>
+            <input type="text" id="new-prompt-name" class="w-full p-2 mb-2 border rounded" placeholder="New prompt name">
+            <textarea id="new-prompt-content" rows="4" class="w-full p-2 mb-2 border rounded" placeholder="New prompt content"></textarea>
+            <button id="add-user-prompt" class="bg-green-500 text-white px-4 py-2 rounded">Add User Prompt</button>
+        </div>
+
         <div id="settings" class="tab-content">
             <h2 class="text-2xl font-bold mb-4">Settings</h2>
             <label for="ollama-api-url" class="block mb-2">Ollama API URL:</label>
@@ -465,6 +495,7 @@ HTML = """
         };
 
         let shortcuts = [];
+        let userPrompts = [];
 
         // Tab functionality
         const tabButtons = document.querySelectorAll('.tab-button');
@@ -545,6 +576,10 @@ HTML = """
                         <option value="">Select a model</option>
                         ${getOllamaModelOptions(step.model)}
                     </select>
+                    <select class="user-prompt-select p-1 border rounded" data-step-index="${index}">
+                        <option value="">Select a user prompt</option>
+                        ${getUserPromptOptions(step.userPromptId)}
+                    </select>
                 </div>
             `;
 
@@ -556,11 +591,48 @@ HTML = """
                 updateStepData(index, 'model', this.value);
             });
 
+            content.querySelector('.user-prompt-select').addEventListener('change', function() {
+                updateStepData(index, 'userPromptId', this.value);
+            });
+
             content.querySelector('.remove-step').addEventListener('click', function() {
                 removeStep(this.getAttribute('data-index'));
             });
 
             return content;
+        }
+
+        function getUserPromptOptions(selectedPromptId) {
+            return `<option value="">No user prompt</option>` + 
+                userPrompts.map(prompt => 
+                    `<option value="${prompt.id}" ${prompt.id === selectedPromptId ? 'selected' : ''}>${prompt.name}</option>`
+                ).join('');
+        }
+
+        function loadUserPrompts() {
+            fetch('/user-prompts')
+                .then(response => response.json())
+                .then(data => {
+                    userPrompts = data;  // Store the prompts globally
+                    const promptList = document.getElementById('user-prompt-list');
+                    promptList.innerHTML = '';
+                    data.forEach(prompt => {
+                        const promptElement = document.createElement('div');
+                        promptElement.className = 'p-4 bg-white rounded shadow';
+                        promptElement.innerHTML = `
+                            <h4 class="font-bold">${prompt.name}</h4>
+                            <p class="mt-2">${prompt.content}</p>
+                            <button class="edit-prompt mt-2 bg-yellow-500 text-white px-2 py-1 rounded" data-id="${prompt.id}">Edit</button>
+                            <button class="delete-prompt mt-2 bg-red-500 text-white px-2 py-1 rounded" data-id="${prompt.id}">Delete</button>
+                        `;
+                        promptList.appendChild(promptElement);
+                    });
+                    updateWorkflowDisplay();  // Add this line to refresh the workflow display
+                })
+                .catch(error => {
+                    console.error('Error:', error);
+                    alert('Failed to load user prompts. Please try again.');
+                });
         }
 
         function removeStep(index) {
@@ -604,12 +676,13 @@ HTML = """
                 stepList.appendChild(createStepElement(step, index));
             });
 
-            // Add event listeners for shortcut and model selection changes
-            stepList.querySelectorAll('.shortcut-select, .model-select').forEach(select => {
+            // Add event listeners for shortcut, model, and user prompt selection changes
+            stepList.querySelectorAll('.shortcut-select, .model-select, .user-prompt-select').forEach(select => {
                 select.addEventListener('change', (e) => {
                     const stepIndex = e.target.getAttribute('data-step-index');
-                    const isShortcut = e.target.classList.contains('shortcut-select');
-                    updateStepData(stepIndex, isShortcut ? 'shortcutName' : 'model', e.target.value);
+                    const property = e.target.classList.contains('shortcut-select') ? 'shortcutName' :
+                                    e.target.classList.contains('model-select') ? 'model' : 'userPromptId';
+                    updateStepData(stepIndex, property, e.target.value);
                 });
             });
 
@@ -1204,6 +1277,17 @@ HTML = """
             statusText.textContent = 'Running shortcut...';
             outputElement.innerHTML = '';
 
+            // Get the selected user prompt
+            const userPromptSelect = document.querySelector('.user-prompt-select');
+            const selectedPromptId = userPromptSelect ? userPromptSelect.value : '';
+
+            if (selectedPromptId) {
+                const selectedPrompt = userPrompts.find(prompt => prompt.id === selectedPromptId);
+                if (selectedPrompt) {
+                    inputJson.user_prompt = selectedPrompt.content;
+                }
+            }
+
             fetch(`/run-shortcut/${encodeURIComponent(shortcutName)}?input=${encodeURIComponent(JSON.stringify(inputJson))}`)
                 .then(response => response.json())
                 .then(data => {
@@ -1485,11 +1569,85 @@ HTML = """
             });
         });
 
+        // User Prompts functionality
+        function loadUserPrompts() {
+            fetch('/user-prompts')
+                .then(response => response.json())
+                .then(data => {
+                    const promptList = document.getElementById('user-prompt-list');
+                    promptList.innerHTML = '';
+                    data.forEach(prompt => {
+                        const promptElement = document.createElement('div');
+                        promptElement.className = 'p-4 bg-white rounded shadow';
+                        promptElement.innerHTML = `
+                            <h4 class="font-bold">${prompt.name}</h4>
+                            <p class="mt-2">${prompt.content}</p>
+                            <button class="edit-prompt mt-2 bg-yellow-500 text-white px-2 py-1 rounded" data-id="${prompt.id}">Edit</button>
+                            <button class="delete-prompt mt-2 bg-red-500 text-white px-2 py-1 rounded" data-id="${prompt.id}">Delete</button>
+                        `;
+                        promptList.appendChild(promptElement);
+                    });
+                })
+                .catch(error => {
+                    console.error('Error:', error);
+                    alert('Failed to load user prompts. Please try again.');
+                });
+        }
+
+        document.getElementById('add-user-prompt').addEventListener('click', () => {
+            const name = document.getElementById('new-prompt-name').value;
+            const content = document.getElementById('new-prompt-content').value;
+            if (name && content) {
+                fetch('/save-user-prompt', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ id: null, name, content })
+                })
+                .then(response => response.json())
+                .then(data => {
+                    alert(data.message);
+                    loadUserPrompts();  // This will refresh the user prompt list
+                    updateWorkflowDisplay();  // This will update the workflow composer
+                    document.getElementById('new-prompt-name').value = '';
+                    document.getElementById('new-prompt-content').value = '';
+                })
+                .catch(error => {
+                    console.error('Error:', error);
+                    alert('Failed to add user prompt. Please try again.');
+                });
+            } else {
+                alert('Please enter both name and content for the user prompt');
+            }
+        });
+
+        document.getElementById('user-prompt-list').addEventListener('click', (e) => {
+            if (e.target.classList.contains('edit-prompt')) {
+                const promptId = e.target.getAttribute('data-id');
+                // Implement edit functionality (you can use a modal or inline editing)
+            } else if (e.target.classList.contains('delete-prompt')) {
+                const promptId = e.target.getAttribute('data-id');
+                if (confirm('Are you sure you want to delete this user prompt?')) {
+                    fetch(`/delete-user-prompt/${promptId}`, { method: 'DELETE' })
+                        .then(response => response.json())
+                        .then(data => {
+                            alert(data.message);
+                            loadUserPrompts();  // This will refresh the user prompt list
+                            updateWorkflowDisplay();  // This will update the workflow composer
+                        })
+                        .catch(error => {
+                            console.error('Error:', error);
+                            alert('Failed to delete user prompt. Please try again.');
+                        });
+                }
+            }
+        });
+
         document.addEventListener('DOMContentLoaded', function() {
             function init() {
                 loadShortcuts();
                 loadWorkflows();
                 loadKnowledgeStructures();
+                loadUserPrompts();
                 // Set dashboard as the initial active tab
                 document.querySelector('[data-tab="dashboard"]').click();
             }
@@ -1577,6 +1735,22 @@ class OllamaHandler(BaseHTTPRequestHandler):
             self.end_headers()
             models = get_ollama_models()
             self.wfile.write(json.dumps(models).encode())
+        elif self.path == '/user-prompts':
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(get_user_prompts()).encode())
+        elif self.path.startswith('/user-prompt/'):
+            prompt_id = self.path.split('/')[-1]
+            prompt = get_user_prompt(prompt_id)
+            if prompt:
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps(prompt).encode())
+            else:
+                self.send_response(404)
+                self.end_headers()
         else:
             self.send_response(200)
             self.send_header('Content-type', 'text/html')
@@ -1653,6 +1827,13 @@ class OllamaHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 logging.error(f"Error saving settings: {str(e)}")
                 self.wfile.write(json.dumps({"error": "Failed to save settings"}).encode())
+        elif self.path == '/save-user-prompt':
+            try:
+                save_user_prompt(data)
+                self.wfile.write(json.dumps({"message": "User prompt saved successfully"}).encode())
+            except Exception as e:
+                logging.error(f"Error saving user prompt: {str(e)}")
+                self.wfile.write(json.dumps({"error": "Failed to save user prompt"}).encode())
         else:
             self.wfile.write(json.dumps({'error': 'Invalid endpoint'}).encode())
 
@@ -1675,6 +1856,20 @@ class OllamaHandler(BaseHTTPRequestHandler):
                 self.send_header('Content-type', 'application/json')
                 self.end_headers()
                 self.wfile.write(json.dumps({"error": "Failed to delete knowledge structure"}).encode())
+        elif self.path.startswith('/delete-user-prompt/'):
+            prompt_id = self.path.split('/')[-1]
+            try:
+                delete_user_prompt(prompt_id)
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"message": "User prompt deleted successfully"}).encode())
+            except Exception as e:
+                logging.error(f"Error deleting user prompt: {str(e)}")
+                self.send_response(500)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": "Failed to delete user prompt"}).encode())
         else:
             self.send_response(404)
             self.send_header('Content-type', 'application/json')
