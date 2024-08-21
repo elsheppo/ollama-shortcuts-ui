@@ -1,4 +1,4 @@
-# Ollama Shortcuts UI
+# OSUI: Ollama Shortcuts UI
 
 Ollama Shortcuts UI is an innovative project that bridges the gap between Ollama's local language models and Apple's Shortcuts app on Mac OS. This web interface allows users to interact with Ollama models through a user-friendly front-end, leveraging Shortcuts as an intermediary to handle API calls and process responses.
 
