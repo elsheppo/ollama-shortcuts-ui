@@ -227,7 +227,7 @@ async def run_workflow(workflow, input_json, status_queue):
             
             branch_tasks = []
             for branch_index, branch in enumerate(step['branches']):
-                branch_input = {**input_json, 'previous_output': output_context.get('previous_output', '')}
+                branch_input = {**input_json, 'user_input': output_context.get('previous_output', '')}
                 branch_tasks.append(run_branch(branch, branch_input, status_queue, current_step, total_steps, branch_index))
             
             branch_results = await asyncio.gather(*branch_tasks)
@@ -242,7 +242,7 @@ async def run_workflow(workflow, input_json, status_queue):
             
             merge_input = {
                 **input_json,
-                'previous_output': output_context.get('previous_output', ''),
+                'user_input': output_context.get('previous_output', ''),
                 'branch_outputs': branch_outputs[f"branch_{step['branchStepIndex']}"]
             }
             try:
@@ -259,7 +259,7 @@ async def run_workflow(workflow, input_json, status_queue):
             
             input_for_step = {
                 **input_json,
-                'previous_output': output_context.get('previous_output', ''),
+                'user_input': output_context.get('previous_output', input_json.get('user_input', '')),
                 'model': step.get('model', input_json.get('model', '')),
                 'shortcut_name': step['shortcutName']
             }
