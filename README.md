@@ -73,3 +73,7 @@ To use this Shortcut:
 - The Ollama team for their amazing language model
 - Apple for the powerful Shortcuts app
 - All contributors and users of Ollama Shortcuts UI
+
+## License
+
+OSUI is open-sourced software licensed under the [MIT license](https://opensource.org/licenses/MIT).
