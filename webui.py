@@ -14,12 +14,15 @@ from urllib.parse import unquote_plus, parse_qs
 # Set up logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Database setup
 def init_db():
     conn = sqlite3.connect('ollama_workflows.db')
     c = conn.cursor()
+    
+    # Create tables if they don't exist
     c.execute('''CREATE TABLE IF NOT EXISTS workflows
-                 (id TEXT PRIMARY KEY, name TEXT, steps TEXT)''')
+                 (id TEXT PRIMARY KEY, name TEXT, steps TEXT, 
+                  form_definition TEXT, user_prompts TEXT,
+                  import_format TEXT, version TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS shortcuts
                  (id TEXT PRIMARY KEY, name TEXT, description TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS knowledge_structures
@@ -27,36 +30,65 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS user_prompts
                  (id TEXT PRIMARY KEY, name TEXT, content TEXT)''')
     
-    # Add form_definition column if it doesn't exist
+    # Check if columns exist and add them if they don't
     c.execute("PRAGMA table_info(workflows)")
     columns = [column[1] for column in c.fetchall()]
+    
+    if 'import_format' not in columns:
+        c.execute("ALTER TABLE workflows ADD COLUMN import_format TEXT")
+    if 'version' not in columns:
+        c.execute("ALTER TABLE workflows ADD COLUMN version TEXT")
     if 'form_definition' not in columns:
         c.execute("ALTER TABLE workflows ADD COLUMN form_definition TEXT")
-
-    # Add user_prompts column if it doesn't exist
     if 'user_prompts' not in columns:
         c.execute("ALTER TABLE workflows ADD COLUMN user_prompts TEXT")
     
     conn.commit()
     conn.close()
 
+
+
 def get_workflows():
     conn = sqlite3.connect('ollama_workflows.db')
     c = conn.cursor()
-    c.execute("SELECT id, name, steps, form_definition FROM workflows")
-    workflows = [{"id": row[0], "name": row[1], "steps": json.loads(row[2]), "form_definition": json.loads(row[3]) if row[3] else None} for row in c.fetchall()]
+    c.execute("SELECT id, name, steps, form_definition, import_format, version FROM workflows")
+    workflows = [{"id": row[0], "name": row[1], "steps": json.loads(row[2]), 
+                  "form_definition": json.loads(row[3]) if row[3] else None,
+                  "import_format": row[4], "version": row[5]} for row in c.fetchall()]
     conn.close()
     return workflows
 
 def save_workflow(workflow):
     conn = sqlite3.connect('ollama_workflows.db')
     c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO workflows (id, name, steps, form_definition, user_prompts) VALUES (?, ?, ?, ?, ?)",
-              (workflow['id'], workflow['name'], json.dumps(workflow['steps']), 
-               json.dumps(workflow.get('form_definition')), 
-               json.dumps(workflow.get('user_prompts', []))))
+    
+    c.execute('''INSERT OR REPLACE INTO workflows 
+                 (id, name, steps, form_definition, import_format, version) 
+                 VALUES (?, ?, ?, ?, ?, ?)''',
+              (workflow['id'], workflow['name'], json.dumps(workflow['steps']),
+               json.dumps(workflow.get('form_definition')),
+               workflow.get('import_format'),
+               workflow.get('version')))
+    
     conn.commit()
     conn.close()
+
+def parse_imported_workflow(import_data):
+    try:
+        workflow = import_data['workflow']
+        required_fields = ['id', 'name', 'steps']
+        for field in required_fields:
+            if field not in workflow:
+                raise ValueError(f"Missing required field: {field}")
+        
+        # Ensure each step has the necessary fields
+        for step in workflow['steps']:
+            if 'id' not in step or 'name' not in step or 'type' not in step:
+                raise ValueError(f"Step is missing required fields: {step}")
+        
+        return workflow
+    except Exception as e:
+        raise ValueError(f"Invalid workflow format: {str(e)}")
 
 def get_shortcuts():
     conn = sqlite3.connect('ollama_workflows.db')
@@ -168,6 +200,13 @@ def delete_user_prompt(prompt_id):
     conn.commit()
     conn.close()
 
+def delete_workflow(workflow_id):
+    conn = sqlite3.connect('ollama_workflows.db')
+    c = conn.cursor()
+    c.execute("DELETE FROM workflows WHERE id = ?", (workflow_id,))
+    conn.commit()
+    conn.close()
+
 def get_ollama_models():
     try:
         result = subprocess.run(['ollama', 'list'], capture_output=True, text=True)
@@ -209,6 +248,11 @@ async def run_workflow(workflow, input_json, status_queue):
     output_context = {}
     branch_outputs = {}
 
+    def replace_merge_tags(text, context):
+        for key, value in context.items():
+            text = text.replace(f"{{{{{key}}}}}", str(value))
+        return text
+
     def count_total_steps(steps):
         total = 0
         for step in steps:
@@ -227,7 +271,7 @@ async def run_workflow(workflow, input_json, status_queue):
             
             branch_tasks = []
             for branch_index, branch in enumerate(step['branches']):
-                branch_input = {**input_json, 'user_input': output_context.get('previous_output', '')}
+                branch_input = {**input_json, 'previous_output': output_context.get('previous_output', '')}
                 branch_tasks.append(run_branch(branch, branch_input, status_queue, current_step, total_steps, branch_index))
             
             branch_results = await asyncio.gather(*branch_tasks)
@@ -242,7 +286,7 @@ async def run_workflow(workflow, input_json, status_queue):
             
             merge_input = {
                 **input_json,
-                'user_input': output_context.get('previous_output', ''),
+                'previous_output': output_context.get('previous_output', ''),
                 'branch_outputs': branch_outputs[f"branch_{step['branchStepIndex']}"]
             }
             try:
@@ -257,17 +301,20 @@ async def run_workflow(workflow, input_json, status_queue):
             current_step += 1
             status_queue.put(json.dumps({"status": "running", "step": current_step, "total": total_steps, "message": f"Executing step: {step.get('name', 'Unnamed Step')}"}))
             
+            # Combine form inputs and previous outputs
+            context = {**input_json, **output_context}
+            
+            # Replace merge tags in system prompt
+            if 'systemPrompt' in step:
+                step['systemPrompt'] = replace_merge_tags(step['systemPrompt'], context)
+
             input_for_step = {
                 **input_json,
                 'user_input': output_context.get('previous_output', input_json.get('user_input', '')),
                 'model': step.get('model', input_json.get('model', '')),
-                'shortcut_name': step['shortcutName']
+                'shortcut_name': step['shortcutName'],
+                'system': step['systemPrompt']
             }
-
-            if step.get('userPromptId'):
-                user_prompt = get_user_prompt(step['userPromptId'])
-                if user_prompt:
-                    input_for_step['user_prompt'] = user_prompt['content']
 
             try:
                 output = await run_shortcut(step['shortcutName'], input_for_step)
@@ -317,6 +364,8 @@ def workflow_runner(workflow, input_json, status_queue):
     except Exception as e:
         logging.error(f"Error in workflow execution: {str(e)}")
         status_queue.put(json.dumps({"status": "error", "message": str(e)}))
+
+
 
 HTML = """
 <!DOCTYPE html>
@@ -385,6 +434,7 @@ HTML = """
             <button class="tab-button bg-blue-500 text-white px-4 py-2 rounded" data-tab="context">Context Manager</button>
             <button class="tab-button bg-blue-500 text-white px-4 py-2 rounded" data-tab="user-prompts">User Prompts</button>
             <button class="tab-button bg-blue-500 text-white px-4 py-2 rounded" data-tab="settings">Settings</button>
+            <button class="tab-button bg-blue-500 text-white px-4 py-2 rounded" data-tab="import-workflow">Import Workflow</button>
         </div>
 
         <div id="dashboard" class="tab-content">
@@ -485,6 +535,12 @@ HTML = """
             <input type="text" id="ollama-api-url" class="w-full p-2 mb-4 border rounded" placeholder="http://localhost:11434">
             <button id="save-settings" class="bg-blue-500 text-white px-4 py-2 rounded">Save Settings</button>
         </div>
+
+        <div id="import-workflow" class="tab-content">
+            <h2 class="text-2xl font-bold mb-4">Import Workflow</h2>
+            <textarea id="import-data" rows="10" class="w-full p-2 mb-4 border rounded" placeholder="Paste your workflow import data here (JSON format)"></textarea>
+            <button id="import-workflow-btn" class="bg-green-500 text-white px-4 py-2 rounded">Import Workflow</button>
+        </div>
     </div>
 
     <script>
@@ -570,16 +626,15 @@ HTML = """
                 <div class="flex flex-col space-y-2">
                     <select class="shortcut-select p-1 border rounded" data-step-index="${index}">
                         <option value="">Select a shortcut</option>
-                        ${getShortcutOptions(step.shortcutName)}
+                        <option value="OSUI_Step1" ${step.shortcutName === 'OSUI_Step1' ? 'selected' : ''}>OSUI_Step1</option>
+                        <option value="OSUI_StepN" ${step.shortcutName === 'OSUI_StepN' ? 'selected' : ''}>OSUI_StepN</option>
                     </select>
                     <select class="model-select p-1 border rounded" data-step-index="${index}">
                         <option value="">Select a model</option>
-                        ${getOllamaModelOptions(step.model)}
+                        <option value="gemma2:2b" ${step.model === 'gemma2:2b' ? 'selected' : ''}>Gemma 2B</option>
+                        <option value="llama3.1:latest" ${step.model === 'llama3.1:latest' ? 'selected' : ''}>Llama 3.1</option>
                     </select>
-                    <select class="user-prompt-select p-1 border rounded" data-step-index="${index}">
-                        <option value="">Select a user prompt</option>
-                        ${getUserPromptOptions(step.userPromptId)}
-                    </select>
+                    <textarea class="system-prompt p-1 border rounded" data-step-index="${index}" placeholder="Enter system prompt">${step.systemPrompt || ''}</textarea>
                 </div>
             `;
 
@@ -591,8 +646,8 @@ HTML = """
                 updateStepData(index, 'model', this.value);
             });
 
-            content.querySelector('.user-prompt-select').addEventListener('change', function() {
-                updateStepData(index, 'userPromptId', this.value);
+            content.querySelector('.system-prompt').addEventListener('input', function() {
+                updateStepData(index, 'systemPrompt', this.value);
             });
 
             content.querySelector('.remove-step').addEventListener('click', function() {
@@ -756,6 +811,21 @@ HTML = """
                 } else {
                     alert("You need to add a branch step before adding a merge step.");
                 }
+            }
+        }
+
+        function deleteWorkflow(workflowId) {
+            if (confirm('Are you sure you want to delete this workflow?')) {
+                fetch(`/delete-workflow/${workflowId}`, { method: 'DELETE' })
+                    .then(response => response.json())
+                    .then(data => {
+                        alert(data.message);
+                        loadWorkflows();  // Refresh the workflow list
+                    })
+                    .catch(error => {
+                        console.error('Error:', error);
+                        alert('Failed to delete workflow. Please try again.');
+                    });
             }
         }
 
@@ -1002,7 +1072,8 @@ HTML = """
                             <p class="mb-2">${JSON.stringify(workflow.steps)}</p>
                             <div id="workflow-form-${workflow.id}" class="mb-4"></div>
                             <textarea id="workflow-input-${workflow.id}" class="w-full p-2 mb-2 border rounded" placeholder="Enter input for the workflow"></textarea>
-                            <button class="run-workflow bg-blue-500 text-white px-4 py-2 rounded" data-id="${workflow.id}">Run Workflow</button>
+                            <button class="run-workflow bg-blue-500 text-white px-4 py-2 rounded mr-2" data-id="${workflow.id}">Run Workflow</button>
+                            <button class="delete-workflow bg-red-500 text-white px-4 py-2 rounded" data-id="${workflow.id}">Delete Workflow</button>
                         `;
                         workflowList.appendChild(workflowElement);
                         
@@ -1015,6 +1086,13 @@ HTML = """
                         if (workflow.form_definition) {
                             createDynamicForm(workflow.id, workflow.form_definition);
                         }
+                    });
+
+                    // Add event listeners after all elements have been added to the DOM
+                    document.querySelectorAll('.delete-workflow').forEach(button => {
+                        button.addEventListener('click', (e) => {
+                            deleteWorkflow(e.target.getAttribute('data-id'));
+                        });
                     });
                 })
                 .catch(error => {
@@ -1642,6 +1720,33 @@ HTML = """
             }
         });
 
+        document.getElementById('import-workflow-btn').addEventListener('click', () => {
+            const importData = document.getElementById('import-data').value;
+            try {
+                const parsedData = JSON.parse(importData);
+                fetch('/import-workflow', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(parsedData)
+                })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.error) {
+                        alert('Error: ' + data.error);
+                    } else {
+                        alert(data.message);
+                        loadWorkflows();  // Refresh the workflow list
+                    }
+                })
+                .catch(error => {
+                    console.error('Error:', error);
+                    alert('Failed to import workflow. Please try again.');
+                });
+            } catch (error) {
+                alert('Invalid JSON format. Please check your import data.');
+            }
+        });
+
         document.addEventListener('DOMContentLoaded', function() {
             function init() {
                 loadShortcuts();
@@ -1834,6 +1939,14 @@ class OllamaHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 logging.error(f"Error saving user prompt: {str(e)}")
                 self.wfile.write(json.dumps({"error": "Failed to save user prompt"}).encode())
+        elif self.path == '/import-workflow':
+            try:
+                imported_workflow = parse_imported_workflow(data)
+                save_workflow(imported_workflow)
+                self.wfile.write(json.dumps({"message": "Workflow imported successfully"}).encode())
+            except Exception as e:
+                logging.error(f"Error importing workflow: {str(e)}")
+                self.wfile.write(json.dumps({"error": str(e)}).encode())
         else:
             self.wfile.write(json.dumps({'error': 'Invalid endpoint'}).encode())
 
