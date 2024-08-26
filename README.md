@@ -76,4 +76,4 @@ To use this Shortcut:
 
 ## License
 
-OSUI is open-sourced software licensed under the [MIT license](https://opensource.org/licenses/MIT).
+This project is licensed under the Apache License, Version 2.0. See the [LICENSE](LICENSE) file for details.
