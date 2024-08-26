@@ -58,10 +58,10 @@ We welcome contributions to Ollama Shortcuts UI! Here's how you can help:
 
 ## Shortcuts Integration
 
-While we can't include Apple Shortcuts directly in this repository due to their proprietary format, we've created a starting block for you. Download it from the following iCloud link:
+While we can't include Apple Shortcuts directly in this repository due to their proprietary format, we've created some starting blocks for you. Download it from the following iCloud links:
 
-- [Ollama Shortcut, Basic Block](https://www.icloud.com/shortcuts/81d8876c3b964a93b553f47d23483f51)
-
+- [Ollama Shortcut, Block 1](https://www.icloud.com/shortcuts/26cc4ca06a4a4bb09537a438f0abc3e5): Make this the starting block in a workflow.
+- [Ollama Shortcut, Block N](https://www.icloud.com/shortcuts/c4efc7b0654d4cb88f0b8d754bdc1913): Extend workflows after Block 1 using this block for each step.
 
 To use this Shortcut:
 1. Click on the links above on your Apple device
