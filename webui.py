@@ -8,6 +8,7 @@ import os
 import logging
 import asyncio
 import threading
+import queue
 from queue import Queue
 from urllib.parse import unquote_plus, parse_qs
 
@@ -358,12 +359,64 @@ async def run_branch(branch_steps, input_json, status_queue, start_step, total_s
             raise
     return output_context['previous_output']
 
-def workflow_runner(workflow, input_json, status_queue):
+def workflow_runner(workflow, input_json, result_queue):
     try:
-        asyncio.run(run_workflow(workflow, input_json, status_queue))
+        async def run_workflow_async():
+            output_context = {}
+            workflow_results = []
+
+            def replace_merge_tags(text, context):
+                for key, value in context.items():
+                    text = text.replace(f"{{{{{key}}}}}", str(value))
+                return text
+
+            total_steps = sum(1 for step in workflow['steps'] if isinstance(step, dict))
+
+            for current_step, step in enumerate(workflow['steps'], start=1):
+                if isinstance(step, dict):
+                    step_result = {
+                        "step_number": current_step,
+                        "step_name": step.get('name', 'Unnamed Step'),
+                        "status": "running",
+                        "input": "",
+                        "output": "",
+                        "error": None
+                    }
+
+                    result_queue.put(json.dumps(step_result))
+
+                    context = {**input_json, **output_context}
+                    if 'systemPrompt' in step:
+                        step['systemPrompt'] = replace_merge_tags(step['systemPrompt'], context)
+
+                    input_for_step = {
+                        **input_json,
+                        'user_input': output_context.get('previous_output', input_json.get('user_input', '')),
+                        'model': step.get('model', input_json.get('model', '')),
+                        'shortcut_name': step['shortcutName'],
+                        'system': step['systemPrompt']
+                    }
+
+                    step_result["input"] = json.dumps(input_for_step)
+
+                    try:
+                        output = await run_shortcut(step['shortcutName'], input_for_step)
+                        output_context['previous_output'] = output
+                        step_result["status"] = "completed"
+                        step_result["output"] = output
+                    except Exception as e:
+                        step_result["status"] = "error"
+                        step_result["error"] = str(e)
+
+                    workflow_results.append(step_result)
+                    result_queue.put(json.dumps(step_result))
+
+            result_queue.put(json.dumps({"status": "completed", "total_steps": total_steps, "results": workflow_results}))
+
+        asyncio.run(run_workflow_async())
     except Exception as e:
         logging.error(f"Error in workflow execution: {str(e)}")
-        status_queue.put(json.dumps({"status": "error", "message": str(e)}))
+        result_queue.put(json.dumps({"status": "error", "message": str(e)}))
 
 
 
@@ -626,13 +679,11 @@ HTML = """
                 <div class="flex flex-col space-y-2">
                     <select class="shortcut-select p-1 border rounded" data-step-index="${index}">
                         <option value="">Select a shortcut</option>
-                        <option value="OSUI_Step1" ${step.shortcutName === 'OSUI_Step1' ? 'selected' : ''}>OSUI_Step1</option>
-                        <option value="OSUI_StepN" ${step.shortcutName === 'OSUI_StepN' ? 'selected' : ''}>OSUI_StepN</option>
+                        ${getShortcutOptions(step.shortcutName)}
                     </select>
                     <select class="model-select p-1 border rounded" data-step-index="${index}">
                         <option value="">Select a model</option>
-                        <option value="gemma2:2b" ${step.model === 'gemma2:2b' ? 'selected' : ''}>Gemma 2B</option>
-                        <option value="llama3.1:latest" ${step.model === 'llama3.1:latest' ? 'selected' : ''}>Llama 3.1</option>
+                        ${getOllamaModelOptions(step.model)}
                     </select>
                     <textarea class="system-prompt p-1 border rounded" data-step-index="${index}" placeholder="Enter system prompt">${step.systemPrompt || ''}</textarea>
                 </div>
@@ -1069,7 +1120,7 @@ HTML = """
                         workflowElement.className = 'p-4 bg-white rounded shadow mb-4';
                         workflowElement.innerHTML = `
                             <h3 class="text-xl font-bold mb-2">${workflow.name}</h3>
-                            <p class="mb-2">${JSON.stringify(workflow.steps)}</p>
+                            <p class="mb-2">${workflow.description || 'No description available'}</p>
                             <div id="workflow-form-${workflow.id}" class="mb-4"></div>
                             <textarea id="workflow-input-${workflow.id}" class="w-full p-2 mb-2 border rounded" placeholder="Enter input for the workflow"></textarea>
                             <button class="run-workflow bg-blue-500 text-white px-4 py-2 rounded mr-2" data-id="${workflow.id}">Run Workflow</button>
@@ -1433,6 +1484,25 @@ HTML = """
             }
         });
 
+        document.getElementById('form-workflow-select').addEventListener('change', (e) => {
+            const workflowId = e.target.value;
+            if (workflowId) {
+                fetch(`/get-workflow/${workflowId}`)
+                    .then(response => response.json())
+                    .then(data => {
+                        currentForm = data.form_definition || [];
+                        updateFormBuilder();
+                    })
+                    .catch(error => {
+                        console.error('Error:', error);
+                        alert('Failed to load workflow form. Please try again.');
+                    });
+            } else {
+                currentForm = [];
+                updateFormBuilder();
+            }
+        });
+
         function updateFormBuilder() {
             const formFields = document.getElementById('form-fields');
             formFields.innerHTML = '';
@@ -1766,11 +1836,28 @@ HTML = """
 
 class OllamaHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path == '/workflows':
+        if self.path == '/api/workflows':
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            workflows = get_workflows()
+            simplified_workflows = [
+                {
+                    'id': w['id'],
+                    'name': w['name'],
+                    'description': w.get('description', 'No description available')
+                }
+                for w in workflows
+            ]
+            self.wfile.write(json.dumps(simplified_workflows).encode())
+            return
+
+        elif self.path == '/workflows':
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.end_headers()
             self.wfile.write(json.dumps(get_workflows()).encode())
+
         elif self.path.startswith('/get-workflow/'):
             workflow_id = self.path.split('/')[-1]
             workflow = next((w for w in get_workflows() if w['id'] == workflow_id), None)
@@ -1782,16 +1869,19 @@ class OllamaHandler(BaseHTTPRequestHandler):
             else:
                 self.send_response(404)
                 self.end_headers()
+
         elif self.path == '/shortcuts':
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.end_headers()
             self.wfile.write(json.dumps(get_shortcuts()).encode())
+
         elif self.path == '/knowledge-structures':
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.end_headers()
             self.wfile.write(json.dumps(get_knowledge_structures()).encode())
+
         elif self.path.startswith('/run-workflow/'):
             self.send_response(200)
             self.send_header('Content-type', 'text/event-stream')
@@ -1819,6 +1909,7 @@ class OllamaHandler(BaseHTTPRequestHandler):
             else:
                 self.wfile.write(b"data: {\"error\": \"Workflow not found\"}\n\n")
                 self.wfile.flush()
+
         elif self.path.startswith('/run-shortcut/'):
             shortcut_name = unquote_plus(self.path.split('/')[2].split('?')[0])
             query = parse_qs(self.path.split('?')[1])
@@ -1834,17 +1925,20 @@ class OllamaHandler(BaseHTTPRequestHandler):
                 self.send_header('Content-type', 'application/json')
                 self.end_headers()
                 self.wfile.write(json.dumps({"error": str(e)}).encode())
+
         elif self.path == '/ollama-models':
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.end_headers()
             models = get_ollama_models()
             self.wfile.write(json.dumps(models).encode())
+
         elif self.path == '/user-prompts':
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.end_headers()
             self.wfile.write(json.dumps(get_user_prompts()).encode())
+
         elif self.path.startswith('/user-prompt/'):
             prompt_id = self.path.split('/')[-1]
             prompt = get_user_prompt(prompt_id)
@@ -1856,6 +1950,26 @@ class OllamaHandler(BaseHTTPRequestHandler):
             else:
                 self.send_response(404)
                 self.end_headers()
+
+        elif self.path.startswith('/api/workflow-details/'):
+            workflow_id = self.path.split('/')[-1]
+            workflow = next((w for w in get_workflows() if w['id'] == workflow_id), None)
+            if workflow:
+                workflow_details = {
+                    'id': workflow['id'],
+                    'name': workflow['name'],
+                    'description': workflow.get('description', 'No description available'),
+                    'form_definition': workflow.get('form_definition', [])
+                }
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps(workflow_details).encode())
+            else:
+                self.send_response(404)
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": "Workflow not found"}).encode())
+
         else:
             self.send_response(200)
             self.send_header('Content-type', 'text/html')
@@ -1878,7 +1992,40 @@ class OllamaHandler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             data = {}
 
-        if self.path == '/save-workflow':
+        if self.path == '/api/run-workflow':
+            try:
+                workflow_id = data.get('workflow_id')
+                input_data = data.get('input', {})
+                if not workflow_id:
+                    raise ValueError("Workflow ID is required")
+                
+                workflow = next((w for w in get_workflows() if w['id'] == workflow_id), None)
+                if not workflow:
+                    raise ValueError(f"Workflow with ID {workflow_id} not found")
+
+                result_queue = Queue()
+                threading.Thread(target=workflow_runner, args=(workflow, input_data, result_queue)).start()
+                
+                final_result = None
+                while True:
+                    try:
+                        result = result_queue.get(timeout=1)
+                        result_data = json.loads(result)
+                        if result_data.get('status') == 'completed':
+                            final_result = result_data
+                            break
+                    except queue.Empty:
+                        continue
+                
+                if final_result:
+                    self.wfile.write(json.dumps(final_result).encode())
+                else:
+                    raise ValueError("Workflow execution did not complete successfully")
+            except Exception as e:
+                logging.error(f"Error running workflow via API: {str(e)}")
+                self.wfile.write(json.dumps({"status": "error", "message": str(e)}).encode())
+                
+        elif self.path == '/save-workflow':
             try:
                 save_workflow(data)
                 self.wfile.write(json.dumps({"message": "Workflow saved successfully"}).encode())
@@ -1999,3 +2146,4 @@ if __name__ == '__main__':
     init_db()
     init_shortcuts()  # Initialize shortcuts on startup
     run_server()
+    
