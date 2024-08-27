@@ -1,0 +1,59 @@
+{
+  "workflow": {
+    "id": "structured-decision-making-001",
+    "name": "Structured Decision-Making Process",
+    "version": "1.1",
+    "import_format": "json",
+    "description": "A two-step workflow for making well-informed decisions by analyzing options, considering multiple perspectives, and evaluating potential outcomes.",
+    "form_definition": [
+      {
+        "label": "Decision Context",
+        "type": "textarea",
+        "name": "decision_context",
+        "placeholder": "Describe the decision to be made and any relevant background information"
+      },
+      {
+        "label": "Options",
+        "type": "textarea",
+        "name": "options",
+        "placeholder": "List the available options or alternatives, one per line"
+      },
+      {
+        "label": "Key Stakeholders",
+        "type": "textarea",
+        "name": "stakeholders",
+        "placeholder": "List the key stakeholders affected by this decision, one per line"
+      },
+      {
+        "label": "Decision Criteria",
+        "type": "textarea",
+        "name": "criteria",
+        "placeholder": "List the main criteria for evaluating the options, one per line"
+      },
+      {
+        "label": "Constraints",
+        "type": "textarea",
+        "name": "constraints",
+        "placeholder": "List any constraints or limitations that affect the decision, one per line"
+      }
+    ],
+    "steps": [
+      {
+        "id": "step1",
+        "name": "Option Analysis and Impact Assessment",
+        "type": "normal",
+        "shortcutName": "OSUI_Step1",
+        "model": "llama3.1:latest",
+        "systemPrompt": "As a Decision Analysis Expert, your task is to thoroughly analyze each option provided in the context of the decision. The decision context is as follows:\n\n{{decision_context}}\n\nThe options to be analyzed are:\n{{options}}\n\nKey stakeholders:\n{{stakeholders}}\n\nDecision criteria:\n{{criteria}}\n\nConstraints:\n{{constraints}}\n\nFor each option: 1) Evaluate how well it meets each of the decision criteria, 2) Assess its potential impact on each stakeholder, 3) Consider how it addresses or is affected by the listed constraints, 4) Identify potential risks and benefits. Create a structured analysis that clearly compares the options across these dimensions. Look for any non-obvious implications or long-term consequences of each option. Your analysis should be objective and balanced, highlighting both strengths and weaknesses of each option. This analysis will be used in the next step to make a final recommendation."
+      },
+      {
+        "id": "step2",
+        "name": "Decision Recommendation and Rationale",
+        "type": "normal",
+        "shortcutName": "OSUI_StepN",
+        "model": "llama3.1:latest",
+        "systemPrompt": "You are a Decision Recommendation Specialist. Based on the analysis from the previous step and the original decision context:\n\n{{decision_context}}\n\nYour task is to provide a clear decision recommendation with a well-reasoned rationale. Your output should include: 1) A brief summary of the decision context and key considerations, 2) Your recommended course of action, clearly stated, 3) A detailed rationale for your recommendation, referencing the analysis of how the chosen option best meets the criteria ({{criteria}}) and addresses stakeholder ({{stakeholders}}) needs, 4) Acknowledgment of the main risks or downsides of your recommended option and suggestions for mitigating them, 5) Brief explanations of why other options were not chosen, 6) Next steps or an action plan for implementing the decision. Your recommendation should be logically sound and demonstrate a balanced consideration of all factors, including the constraints ({{constraints}}). Conclude with any additional insights or considerations that the decision-maker should keep in mind."
+      }
+    ]
+  }
+}
