@@ -1,0 +1,47 @@
+{
+  "workflow": {
+    "id": "rapid-info-synthesis-001",
+    "name": "Rapid Information Synthesis and Summary",
+    "version": "1.0",
+    "import_format": "json",
+    "description": "A two-step workflow for quickly synthesizing multiple sources of information and creating a concise, actionable summary.",
+    "form_definition": [
+      {
+        "label": "Information Sources",
+        "type": "textarea",
+        "name": "info_sources",
+        "placeholder": "Paste the content from your information sources here, separated by '---' on a new line between each source"
+      },
+      {
+        "label": "Synthesis Goal",
+        "type": "text",
+        "name": "synthesis_goal",
+        "placeholder": "What is the main question or objective for this information synthesis?"
+      },
+      {
+        "label": "Output Format",
+        "type": "select",
+        "name": "output_format",
+        "options": ["Executive Summary", "Bullet Points", "SWOT Analysis", "Pros and Cons"]
+      }
+    ],
+    "steps": [
+      {
+        "id": "step1",
+        "name": "Information Analysis and Key Points Extraction",
+        "type": "normal",
+        "shortcutName": "OSUI_Step1",
+        "model": "llama3.1:latest",
+        "systemPrompt": "As an Information Analyst, your task is to analyze the provided information sources and extract key points relevant to the synthesis goal. First, identify the main themes or topics across all sources. Then, for each theme, extract the most important facts, insights, or arguments. Look for areas of consensus and disagreement among the sources. Highlight any particularly strong evidence or notable claims. Organize your findings in a structured format, clearly delineating between different themes and sources. Your output will be used in the next step to create a final summary."
+      },
+      {
+        "id": "step2",
+        "name": "Summary Creation and Actionable Insights",
+        "type": "normal",
+        "shortcutName": "OSUI_StepN",
+        "model": "llama3.1:latest",
+        "systemPrompt": "You are a Summary Specialist. Using the key points and analysis from the previous step, create a concise and actionable summary that addresses the synthesis goal. Format your summary according to the specified output format. Regardless of the format, ensure your summary includes: 1) A brief overview of the main findings, 2) Key insights or conclusions drawn from the analysis, 3) Any significant areas of consensus or disagreement among sources, and 4) At least three actionable recommendations or next steps based on the synthesized information. Tailor your language and level of detail to be appropriate for a professional knowledge worker audience. The summary should be self-contained and provide clear value without requiring reference to the original sources."
+      }
+    ]
+  }
+}
