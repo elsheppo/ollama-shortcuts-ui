@@ -47,8 +47,6 @@ def init_db():
     conn.commit()
     conn.close()
 
-
-
 def get_workflows():
     conn = sqlite3.connect('ollama_workflows.db')
     c = conn.cursor()
@@ -477,8 +475,9 @@ HTML = """
 </head>
 <body class="bg-gray-100">
     <div class="container mx-auto p-4">
-        <h1 class="text-3xl font-bold mb-4">Ollama Workflow Master</h1>
-        
+        <h1 class="text-3xl font-bold mb-4">Ollama Shortcuts UI</h1>
+        <p class="mb-2">Bootleg Apple Intelligence for Mac OS + Ollama</p>       
+
         <div class="mb-4">
             <button class="tab-button bg-blue-500 text-white px-4 py-2 rounded" data-tab="dashboard">Dashboard</button>
             <button class="tab-button bg-blue-500 text-white px-4 py-2 rounded" data-tab="workflows">Workflows</button>
@@ -626,7 +625,7 @@ HTML = """
         function createStepElement(step, index, depth = 0) {
             const stepElement = document.createElement('div');
             stepElement.className = `workflow-step drag-item p-2 bg-gray-200 rounded flex flex-col justify-between items-stretch mb-2 ml-${depth * 4}`;
-            
+
             if (step.type === WorkflowStepTypes.BRANCH) {
                 stepElement.className += ' parallel-branch';
                 stepElement.innerHTML = `
@@ -648,7 +647,7 @@ HTML = """
                     });
                     branchContainer.appendChild(branchElement);
                 });
-                
+
                 stepElement.querySelector('.add-branch-step').addEventListener('click', () => {
                     const branchIndex = prompt(`Which branch do you want to add a step to? (1-${step.branches.length})`);
                     if (branchIndex && branchIndex > 0 && branchIndex <= step.branches.length) {
@@ -656,7 +655,8 @@ HTML = """
                             type: WorkflowStepTypes.NORMAL,
                             name: `New Step in Branch ${branchIndex}`,
                             shortcutName: '',
-                            model: ''
+                            model: '',
+                            systemPrompt: ''
                         });
                         updateWorkflowDisplay();
                     }
@@ -664,7 +664,7 @@ HTML = """
             } else {
                 stepElement.appendChild(createStepContent(step, index, step.type === WorkflowStepTypes.MERGE ? 'Merge Step' : 'Step'));
             }
-            
+
             return stepElement;
         }
 
@@ -689,6 +689,11 @@ HTML = """
                 </div>
             `;
 
+            // Set the initial values for shortcut and model selects
+            content.querySelector('.shortcut-select').value = step.shortcutName || '';
+            content.querySelector('.model-select').value = step.model || '';
+
+            // Add event listeners
             content.querySelector('.shortcut-select').addEventListener('change', function() {
                 updateStepData(index, 'shortcutName', this.value);
             });
@@ -782,12 +787,12 @@ HTML = """
                 stepList.appendChild(createStepElement(step, index));
             });
 
-            // Add event listeners for shortcut, model, and user prompt selection changes
-            stepList.querySelectorAll('.shortcut-select, .model-select, .user-prompt-select').forEach(select => {
-                select.addEventListener('change', (e) => {
+            // Add event listeners for shortcut, model, and system prompt changes
+            stepList.querySelectorAll('.shortcut-select, .model-select, .system-prompt').forEach(element => {
+                element.addEventListener('change', (e) => {
                     const stepIndex = e.target.getAttribute('data-step-index');
                     const property = e.target.classList.contains('shortcut-select') ? 'shortcutName' :
-                                    e.target.classList.contains('model-select') ? 'model' : 'userPromptId';
+                                    e.target.classList.contains('model-select') ? 'model' : 'systemPrompt';
                     updateStepData(stepIndex, property, e.target.value);
                 });
             });
@@ -813,6 +818,9 @@ HTML = """
                 step = step.branches[indices[1]][indices[2]];
             }
             step[property] = value;
+
+            // Trigger save to persist changes
+            saveWorkflow();
         }
 
         function addNormalStep() {
@@ -868,18 +876,35 @@ HTML = """
         function deleteWorkflow(workflowId) {
             if (confirm('Are you sure you want to delete this workflow?')) {
                 fetch(`/delete-workflow/${workflowId}`, { method: 'DELETE' })
-                    .then(response => response.json())
-                    .then(data => {
-                        alert(data.message);
-                        loadWorkflows();  // Refresh the workflow list
+                    .then(response => {
+                        if (!response.ok) {
+                            throw new Error(`HTTP error! status: ${response.status}`);
+                        }
+                        return response.text();
+                    })
+                    .then(text => {
+                        // Attempt to parse the response as JSON
+                        try {
+                            const data = JSON.parse(text);
+                            alert(data.message || 'Workflow deleted successfully');
+                            loadWorkflows();  // Refresh the workflow list
+                        } catch (e) {
+                            console.error('Error parsing JSON:', e);
+                            // If parsing fails, check if the response contains a success message
+                            if (text.includes('successfully')) {
+                                alert('Workflow deleted successfully');
+                                loadWorkflows();  // Refresh the workflow list
+                            } else {
+                                throw new Error('Invalid response format');
+                            }
+                        }
                     })
                     .catch(error => {
-                        console.error('Error:', error);
-                        alert('Failed to delete workflow. Please try again.');
+                        console.error('Error deleting workflow:', error);
+                        alert(`Failed to delete workflow. Error: ${error.message}`);
                     });
             }
         }
-
         // Event listeners for the add step buttons
         document.getElementById('add-step').addEventListener('click', addNormalStep);
         document.getElementById('add-branch').addEventListener('click', addBranchStep);
@@ -899,7 +924,6 @@ HTML = """
                     .then(response => response.json())
                     .then(data => {
                         currentWorkflow = data;
-                        currentWorkflow.form_definition = currentWorkflow.form_definition || [];
                         document.getElementById('workflow-name').value = currentWorkflow.name || '';
                         updateWorkflowDisplay();
                         updateWorkflowForm();
@@ -909,7 +933,7 @@ HTML = """
                         alert('Failed to load workflow. Please try again.');
                     });
             } else {
-                currentWorkflow = { id: '', name: 'New Workflow', steps: [], form_definition: [] };
+                currentWorkflow = { id: '', name: '', steps: [], form_definition: [] };
                 document.getElementById('workflow-name').value = '';
                 updateWorkflowDisplay();
                 updateWorkflowForm();
@@ -1086,24 +1110,40 @@ HTML = """
             if (workflowName) {
                 currentWorkflow.name = workflowName;
                 currentWorkflow.id = currentWorkflow.id || String(Date.now());
-                fetch('/save-workflow', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(currentWorkflow)
-                })
-                .then(response => response.json())
-                .then(data => {
-                    alert(data.message);
-                    loadWorkflows();
-                })
-                .catch(error => {
-                    console.error('Error:', error);
-                    alert('Failed to save workflow. Please try again.');
-                });
+                saveWorkflow();
             } else {
                 alert('Please enter a workflow name');
             }
         });
+
+        function saveWorkflow() {
+            fetch('/save-workflow', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(currentWorkflow)
+            })
+            .then(response => response.text())
+            .then(text => {
+                // Extract the JSON part of the response
+                const jsonStart = text.indexOf('{');
+                const jsonEnd = text.lastIndexOf('}');
+                if (jsonStart !== -1 && jsonEnd !== -1) {
+                    const jsonStr = text.slice(jsonStart, jsonEnd + 1);
+                    return JSON.parse(jsonStr);
+                } else {
+                    throw new Error('Invalid response format');
+                }
+            })
+            .then(data => {
+                console.log('Workflow saved successfully:', data);
+                alert(data.message || 'Workflow saved successfully');
+                loadWorkflows();
+            })
+            .catch(error => {
+                console.error('Error saving workflow:', error);
+                alert(`Failed to save workflow. Error: ${error.message}`);
+            });
+        }
 
         function loadWorkflows() {
             fetch('/workflows')
@@ -2025,13 +2065,29 @@ class OllamaHandler(BaseHTTPRequestHandler):
                 logging.error(f"Error running workflow via API: {str(e)}")
                 self.wfile.write(json.dumps({"status": "error", "message": str(e)}).encode())
                 
-        elif self.path == '/save-workflow':
+        if self.path == '/save-workflow':
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
             try:
-                save_workflow(data)
+                workflow_id = data.get('id')
+                if not workflow_id:
+                    raise ValueError("Workflow ID is required")
+
+                # Update existing workflow or create a new one
+                existing_workflows = get_workflows()
+                workflow = next((w for w in existing_workflows if w['id'] == workflow_id), None)
+                if workflow:
+                    workflow.update(data)
+                else:
+                    workflow = data
+
+                save_workflow(workflow)
+
                 self.wfile.write(json.dumps({"message": "Workflow saved successfully"}).encode())
             except Exception as e:
                 logging.error(f"Error saving workflow: {str(e)}")
-                self.wfile.write(json.dumps({"error": "Failed to save workflow"}).encode())
+                self.wfile.write(json.dumps({"error": f"Failed to save workflow: {str(e)}"}).encode())
         elif self.path.startswith('/save-form/'):
             workflow_id = self.path.split('/')[-1]
             try:
@@ -2130,6 +2186,20 @@ class OllamaHandler(BaseHTTPRequestHandler):
                 self.send_header('Content-type', 'application/json')
                 self.end_headers()
                 self.wfile.write(json.dumps({"error": "Failed to delete user prompt"}).encode())
+        elif self.path.startswith('/delete-workflow/'):
+            workflow_id = self.path.split('/')[-1]
+            try:
+                delete_workflow(workflow_id)
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"message": "Workflow deleted successfully"}).encode())
+            except Exception as e:
+                logging.error(f"Error deleting workflow: {str(e)}")
+                self.send_response(500)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": "Failed to delete workflow"}).encode())
         else:
             self.send_response(404)
             self.send_header('Content-type', 'application/json')
