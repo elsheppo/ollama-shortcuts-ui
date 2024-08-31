@@ -637,7 +637,6 @@ HTML = """
             <select id="shortcut-select" class="w-full p-2 mb-4 border rounded">
                 <option value="">Add step</option>
             </select>
-            <button id="add-parallel" class="bg-green-500 text-white px-4 py-2 rounded">Add Parallel Branch</button>
             <button id="save-workflow" class="bg-blue-500 text-white px-4 py-2 rounded">Save Workflow</button>
             <div id="workflow-form" class="mt-4"></div>
             <textarea id="workflow-input" class="w-full p-2 mt-4 border rounded" placeholder="Enter input for the workflow"></textarea>
@@ -933,10 +932,11 @@ HTML = """
                 step = step.branches[indices[1]][indices[2]];
             }
             step[property] = value;
-
-            // Trigger save to persist changes
-            saveWorkflow();
         }
+
+        document.getElementById('workflow-name').addEventListener('input', function() {
+            currentWorkflow.name = this.value;
+        });
 
         function addNormalStep() {
             const stepName = prompt("Enter step name:");
@@ -1228,23 +1228,19 @@ HTML = """
             }
         });
 
-        document.getElementById('add-parallel').addEventListener('click', () => {
-            currentWorkflow.steps.push([]);
-            updateWorkflowDisplay();
-        });
-
         document.getElementById('save-workflow').addEventListener('click', () => {
-            const workflowName = document.getElementById('workflow-name').value;
-            if (workflowName) {
-                currentWorkflow.name = workflowName;
-                currentWorkflow.id = currentWorkflow.id || String(Date.now());
-                saveWorkflow();
-            } else {
-                alert('Please enter a workflow name');
+            if (!currentWorkflow.id) {
+                currentWorkflow.id = String(Date.now());
             }
+            saveWorkflow();
         });
 
         function saveWorkflow() {
+            if (!currentWorkflow.name) {
+                alert('Please enter a workflow name');
+                return;
+            }
+
             const workflowData = {
                 ...currentWorkflow,
                 knowledge_structures: getSelectedKnowledgeStructures()
@@ -1277,7 +1273,6 @@ HTML = """
                 alert(`Failed to save workflow. Error: ${error.message}`);
             });
         }
-
         function getSelectedKnowledgeStructures() {
             const knowledgeStructureSelects = document.querySelectorAll('select[name^="knowledge_structure"]');
             const selectedStructures = [];
@@ -2215,7 +2210,8 @@ class OllamaHandler(BaseHTTPRequestHandler):
             try:
                 workflow_id = data.get('id')
                 if not workflow_id:
-                    raise ValueError("Workflow ID is required")
+                    workflow_id = str(int(time.time() * 1000))  # Generate a new ID if not provided
+                    data['id'] = workflow_id
 
                 # Update existing workflow or create a new one
                 existing_workflows = get_workflows()
@@ -2227,7 +2223,7 @@ class OllamaHandler(BaseHTTPRequestHandler):
 
                 save_workflow(workflow)
 
-                self.wfile.write(json.dumps({"message": "Workflow saved successfully"}).encode())
+                self.wfile.write(json.dumps({"message": "Workflow saved successfully", "id": workflow_id}).encode())
             except Exception as e:
                 logging.error(f"Error saving workflow: {str(e)}")
                 self.wfile.write(json.dumps({"error": f"Failed to save workflow: {str(e)}"}).encode())
