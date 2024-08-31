@@ -429,6 +429,11 @@ def workflow_runner(workflow, input_json, result_queue):
                         total += 1
                 return total
 
+            def replace_merge_tags(text, context):
+                for key, value in context.items():
+                    text = text.replace(f"{{{{{key}}}}}", str(value))
+                return text
+
             total_steps = count_total_steps(workflow['steps'])
             current_step = 0
 
@@ -498,12 +503,19 @@ def workflow_runner(workflow, input_json, result_queue):
                         "message": f"Executing step: {step.get('name', 'Unnamed Step')}"
                     }))
                     
+                    # Combine input_json and output_context for merge tag replacement
+                    context = {**input_json, **output_context}
+                    
+                    # Replace merge tags in systemPrompt
+                    system_prompt = step.get('systemPrompt', '')
+                    system_prompt = replace_merge_tags(system_prompt, context)
+
                     input_for_step = {
                         **input_json,
                         'user_input': output_context.get('previous_output', input_json.get('user_input', '')),
                         'model': step.get('model', input_json.get('model', '')),
                         'shortcut_name': step['shortcutName'],
-                        'system': step.get('systemPrompt', '')
+                        'system': system_prompt
                     }
 
                     try:
