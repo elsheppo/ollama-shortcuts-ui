@@ -30,6 +30,11 @@ def init_db():
                  (id TEXT PRIMARY KEY, name TEXT, content TEXT, parent_id TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS user_prompts
                  (id TEXT PRIMARY KEY, name TEXT, content TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS workflow_knowledge_structures
+                 (workflow_id TEXT, structure_id TEXT,
+                 PRIMARY KEY (workflow_id, structure_id),
+                 FOREIGN KEY (workflow_id) REFERENCES workflows(id),
+                 FOREIGN KEY (structure_id) REFERENCES knowledge_structures(id))''')
     
     # Check if columns exist and add them if they don't
     c.execute("PRAGMA table_info(workflows)")
@@ -60,17 +65,29 @@ def get_workflows():
 def save_workflow(workflow):
     conn = sqlite3.connect('ollama_workflows.db')
     c = conn.cursor()
-    
-    c.execute('''INSERT OR REPLACE INTO workflows 
-                 (id, name, steps, form_definition, import_format, version) 
-                 VALUES (?, ?, ?, ?, ?, ?)''',
-              (workflow['id'], workflow['name'], json.dumps(workflow['steps']),
-               json.dumps(workflow.get('form_definition')),
-               workflow.get('import_format'),
-               workflow.get('version')))
-    
-    conn.commit()
-    conn.close()
+
+    try:
+        c.execute('''INSERT OR REPLACE INTO workflows 
+                     (id, name, steps, form_definition, import_format, version) 
+                     VALUES (?, ?, ?, ?, ?, ?)''',
+                  (workflow['id'], workflow['name'], json.dumps(workflow['steps']),
+                   json.dumps(workflow.get('form_definition')),
+                   workflow.get('import_format'),
+                   workflow.get('version')))
+
+        # Save knowledge structure associations
+        if 'knowledge_structures' in workflow:
+            c.execute("DELETE FROM workflow_knowledge_structures WHERE workflow_id = ?", (workflow['id'],))
+            for structure_id in workflow['knowledge_structures']:
+                c.execute("INSERT INTO workflow_knowledge_structures (workflow_id, structure_id) VALUES (?, ?)",
+                          (workflow['id'], structure_id))
+
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise e
+    finally:
+        conn.close()
 
 def parse_imported_workflow(import_data):
     try:
@@ -247,6 +264,10 @@ async def run_workflow(workflow, input_json, status_queue):
     output_context = {}
     branch_outputs = {}
 
+    # Fetch knowledge structures for the workflow
+    knowledge_structures = get_workflow_knowledge_structures(workflow['id'])
+    input_json['knowledge_structures'] = knowledge_structures
+
     def replace_merge_tags(text, context):
         for key, value in context.items():
             text = text.replace(f"{{{{{key}}}}}", str(value))
@@ -267,22 +288,22 @@ async def run_workflow(workflow, input_json, status_queue):
     for i, step in enumerate(workflow['steps']):
         if isinstance(step, dict) and step.get('type') == 'branch':
             status_queue.put(json.dumps({"status": "running", "step": current_step + 1, "total": total_steps, "message": f"Starting parallel branch with {len(step['branches'])} branches"}))
-            
+
             branch_tasks = []
             for branch_index, branch in enumerate(step['branches']):
                 branch_input = {**input_json, 'previous_output': output_context.get('previous_output', '')}
                 branch_tasks.append(run_branch(branch, branch_input, status_queue, current_step, total_steps, branch_index))
-            
+
             branch_results = await asyncio.gather(*branch_tasks)
             branch_outputs[f"branch_{i}"] = {f"branch_{j}": result for j, result in enumerate(branch_results)}
-            
+
             current_step += sum(len(branch) for branch in step['branches'])
             status_queue.put(json.dumps({"status": "output", "step": current_step, "total": total_steps, "output": "Parallel branches completed"}))
-        
+
         elif isinstance(step, dict) and step.get('type') == 'merge':
             current_step += 1
             status_queue.put(json.dumps({"status": "running", "step": current_step, "total": total_steps, "message": "Executing merge step"}))
-            
+
             merge_input = {
                 **input_json,
                 'previous_output': output_context.get('previous_output', ''),
@@ -295,24 +316,31 @@ async def run_workflow(workflow, input_json, status_queue):
             except Exception as e:
                 status_queue.put(json.dumps({"status": "error", "step": current_step, "total": total_steps, "message": f"Error in merge step: {str(e)}"}))
                 raise
-        
+
         else:
             current_step += 1
             status_queue.put(json.dumps({"status": "running", "step": current_step, "total": total_steps, "message": f"Executing step: {step.get('name', 'Unnamed Step')}"}))
-            
+
             # Combine form inputs and previous outputs
             context = {**input_json, **output_context}
-            
+
             # Replace merge tags in system prompt
             if 'systemPrompt' in step:
                 step['systemPrompt'] = replace_merge_tags(step['systemPrompt'], context)
+
+            # Prepare step-specific knowledge structures
+            step_knowledge_structures = {
+                str(ks_id): next((ks for ks in knowledge_structures if str(ks['id']) == str(ks_id)), None)
+                for ks_id in step.get('knowledgeStructures', [])
+            }
 
             input_for_step = {
                 **input_json,
                 'user_input': output_context.get('previous_output', input_json.get('user_input', '')),
                 'model': step.get('model', input_json.get('model', '')),
                 'shortcut_name': step['shortcutName'],
-                'system': step['systemPrompt']
+                'system': step['systemPrompt'],
+                'knowledge_structures': step_knowledge_structures
             }
 
             try:
@@ -324,6 +352,35 @@ async def run_workflow(workflow, input_json, status_queue):
                 raise
 
     status_queue.put(json.dumps({"status": "completed", "total": total_steps}))
+
+def get_workflow_knowledge_structures(workflow_id):
+    conn = sqlite3.connect('ollama_workflows.db')
+    c = conn.cursor()
+    
+    c.execute("""
+        SELECT DISTINCT ks.id, ks.name, ks.content, ks.parent_id
+        FROM knowledge_structures ks
+        JOIN workflow_knowledge_structures wks ON ks.id = wks.structure_id
+        WHERE wks.workflow_id = ?
+    """, (workflow_id,))
+    structures = [{"id": row[0], "name": row[1], "content": row[2], "parent_id": row[3]} for row in c.fetchall()]
+    
+    # Fetch child structures for parent structures
+    for structure in structures:
+        if structure['parent_id'] is None:  # This is a parent structure
+            c.execute("""
+                SELECT id, name, content
+                FROM knowledge_structures
+                WHERE parent_id = ?
+            """, (structure['id'],))
+            children = [{"id": row[0], "name": row[1], "content": row[2]} for row in c.fetchall()]
+            structure['children'] = children
+            structure['full_content'] = structure['content'] + "\n\n" + "\n\n".join([child['content'] for child in children])
+        else:
+            structure['full_content'] = structure['content']
+
+    conn.close()
+    return structures
     
 async def run_branch(branch_steps, input_json, status_queue, start_step, total_steps, branch_index):
     output_context = {}
@@ -361,55 +418,113 @@ def workflow_runner(workflow, input_json, result_queue):
     try:
         async def run_workflow_async():
             output_context = {}
-            workflow_results = []
+            branch_outputs = {}
 
-            def replace_merge_tags(text, context):
-                for key, value in context.items():
-                    text = text.replace(f"{{{{{key}}}}}", str(value))
-                return text
+            def count_total_steps(steps):
+                total = 0
+                for step in steps:
+                    if isinstance(step, dict) and step.get('type') == 'branch':
+                        total += sum(len(branch) for branch in step['branches'])
+                    else:
+                        total += 1
+                return total
 
-            total_steps = sum(1 for step in workflow['steps'] if isinstance(step, dict))
+            total_steps = count_total_steps(workflow['steps'])
+            current_step = 0
 
-            for current_step, step in enumerate(workflow['steps'], start=1):
-                if isinstance(step, dict):
-                    step_result = {
-                        "step_number": current_step,
-                        "step_name": step.get('name', 'Unnamed Step'),
-                        "status": "running",
-                        "input": "",
-                        "output": "",
-                        "error": None
+            for i, step in enumerate(workflow['steps']):
+                if isinstance(step, dict) and step.get('type') == 'branch':
+                    result_queue.put(json.dumps({
+                        "status": "running", 
+                        "step": current_step + 1, 
+                        "total": total_steps, 
+                        "message": f"Starting parallel branch with {len(step['branches'])} branches"
+                    }))
+                    
+                    branch_tasks = []
+                    for branch_index, branch in enumerate(step['branches']):
+                        branch_input = {**input_json, 'previous_output': output_context.get('previous_output', '')}
+                        branch_tasks.append(run_branch(branch, branch_input, result_queue, current_step, total_steps, branch_index))
+                    
+                    branch_results = await asyncio.gather(*branch_tasks)
+                    branch_outputs[f"branch_{i}"] = {f"branch_{j}": result for j, result in enumerate(branch_results)}
+                    
+                    current_step += sum(len(branch) for branch in step['branches'])
+                    result_queue.put(json.dumps({
+                        "status": "output", 
+                        "step": current_step, 
+                        "total": total_steps, 
+                        "output": "Parallel branches completed"
+                    }))
+                
+                elif isinstance(step, dict) and step.get('type') == 'merge':
+                    current_step += 1
+                    result_queue.put(json.dumps({
+                        "status": "running", 
+                        "step": current_step, 
+                        "total": total_steps, 
+                        "message": "Executing merge step"
+                    }))
+                    
+                    merge_input = {
+                        **input_json,
+                        'previous_output': output_context.get('previous_output', ''),
+                        'branch_outputs': branch_outputs[f"branch_{step['branchStepIndex']}"]
                     }
-
-                    result_queue.put(json.dumps(step_result))
-
-                    context = {**input_json, **output_context}
-                    if 'systemPrompt' in step:
-                        step['systemPrompt'] = replace_merge_tags(step['systemPrompt'], context)
-
+                    try:
+                        output = await run_shortcut(step['shortcutName'], merge_input)
+                        output_context['previous_output'] = output
+                        result_queue.put(json.dumps({
+                            "status": "output", 
+                            "step": current_step, 
+                            "total": total_steps, 
+                            "output": output
+                        }))
+                    except Exception as e:
+                        result_queue.put(json.dumps({
+                            "status": "error", 
+                            "step": current_step, 
+                            "total": total_steps, 
+                            "message": f"Error in merge step: {str(e)}"
+                        }))
+                        raise
+                
+                else:
+                    current_step += 1
+                    result_queue.put(json.dumps({
+                        "status": "running", 
+                        "step": current_step, 
+                        "total": total_steps, 
+                        "message": f"Executing step: {step.get('name', 'Unnamed Step')}"
+                    }))
+                    
                     input_for_step = {
                         **input_json,
                         'user_input': output_context.get('previous_output', input_json.get('user_input', '')),
                         'model': step.get('model', input_json.get('model', '')),
                         'shortcut_name': step['shortcutName'],
-                        'system': step['systemPrompt']
+                        'system': step.get('systemPrompt', '')
                     }
-
-                    step_result["input"] = json.dumps(input_for_step)
 
                     try:
                         output = await run_shortcut(step['shortcutName'], input_for_step)
                         output_context['previous_output'] = output
-                        step_result["status"] = "completed"
-                        step_result["output"] = output
+                        result_queue.put(json.dumps({
+                            "status": "output", 
+                            "step": current_step, 
+                            "total": total_steps, 
+                            "output": output
+                        }))
                     except Exception as e:
-                        step_result["status"] = "error"
-                        step_result["error"] = str(e)
+                        result_queue.put(json.dumps({
+                            "status": "error", 
+                            "step": current_step, 
+                            "total": total_steps, 
+                            "message": f"Error in step {step.get('name', 'Unnamed Step')}: {str(e)}"
+                        }))
+                        raise
 
-                    workflow_results.append(step_result)
-                    result_queue.put(json.dumps(step_result))
-
-            result_queue.put(json.dumps({"status": "completed", "total_steps": total_steps, "results": workflow_results}))
+            result_queue.put(json.dumps({"status": "completed", "total": total_steps}))
 
         asyncio.run(run_workflow_async())
     except Exception as e:
@@ -1008,58 +1123,70 @@ HTML = """
             console.log('Input JSON:', inputJson);
 
             const statusElement = document.getElementById('workflow-status');
+            if (!statusElement) {
+                console.error('Workflow status element not found');
+                alert('Error: Workflow status element not found. Please refresh the page and try again.');
+                return;
+            }
+
             const progressBar = statusElement.querySelector('.progress-bar-fill');
             const statusText = statusElement.querySelector('.status-text');
             const stepOutputs = statusElement.querySelector('.step-outputs');
+
+            if (!progressBar || !statusText || !stepOutputs) {
+                console.error('One or more required elements not found in the workflow status');
+                alert('Error: Some required elements are missing. Please refresh the page and try again.');
+                return;
+            }
 
             statusElement.style.display = 'block';
             progressBar.style.width = '0%';
             statusText.textContent = 'Initializing workflow...';
             stepOutputs.innerHTML = '';
 
-            // Collect all form data
-            const formData = {};
-            const formElement = document.getElementById(`workflow-form-${workflowId}`);
-            if (formElement) {
-                formElement.querySelectorAll('input, select, textarea').forEach(element => {
-                    if (element.type === 'select-multiple') {
-                        formData[element.name] = Array.from(element.selectedOptions).map(option => ({
-                            id: option.value,
-                            name: option.textContent
-                        }));
-                    } else {
-                        formData[element.name] = element.value;
-                    }
-                });
-            }
-
-            // Combine all input data
-            const completeInputJson = {
-                ...inputJson,
-                ...formData,
-                model: document.querySelector('.model-select').value, // Ensure model is always included
-                workflow_steps: currentWorkflow.steps
-            };
-
             const eventSource = new EventSource(`/run-workflow/${workflowId}?input=${encodeURIComponent(JSON.stringify(inputJson))}`);
 
             eventSource.onmessage = function(event) {
+                console.log('Received event data:', event.data);
                 const data = JSON.parse(event.data);
+                console.log('Parsed data:', data);
+
                 if (data.status === 'running') {
-                    const progress = (data.step / data.total) * 100;
-                    progressBar.style.width = `${progress}%`;
-                    statusText.textContent = `Running step ${data.step} of ${data.total}`;
+                    console.log('Running status received:', data);
+                    if (data.step !== undefined && data.total !== undefined) {
+                        const progress = (data.step / data.total) * 100;
+                        progressBar.style.width = `${progress}%`;
+                        statusText.textContent = `${data.message || `Running step ${data.step} of ${data.total}`}`;
+                    } else {
+                        console.warn('Step or total is undefined:', data);
+                        statusText.textContent = data.message || 'Running workflow...';
+                    }
                 } else if (data.status === 'output') {
+                    console.log('Output received:', data);
                     const outputElement = document.createElement('div');
                     outputElement.className = 'mb-4 p-4 bg-gray-100 rounded';
+                    
+                    const encodedOutput = data.output
+                        .replace(/&/g, '&amp;')
+                        .replace(/</g, '&lt;')
+                        .replace(/>/g, '&gt;')
+                        .replace(/"/g, '&quot;')
+                        .replace(/'/g, '&#039;');
+
                     outputElement.innerHTML = `
                         <h4 class="font-bold mb-2">Step ${data.step} Output:</h4>
-                        <pre class="whitespace-pre-wrap">${data.output}</pre>
+                        <pre class="whitespace-pre-wrap">${encodedOutput}</pre>
+                        <button class="copy-output mt-2 bg-gray-500 text-white px-2 py-1 rounded text-sm" data-output="${encodedOutput}">Copy to Clipboard</button>
                     `;
                     stepOutputs.appendChild(outputElement);
                 } else if (data.status === 'completed') {
+                    console.log('Workflow completed');
                     progressBar.style.width = '100%';
                     statusText.textContent = 'Workflow completed successfully';
+                    eventSource.close();
+                } else if (data.status === 'error') {
+                    console.error('Workflow error:', data.message);
+                    statusText.textContent = `Error: ${data.message}`;
                     eventSource.close();
                 }
             };
@@ -1067,6 +1194,7 @@ HTML = """
             eventSource.onerror = function(error) {
                 console.error('EventSource failed:', error);
                 statusText.textContent = 'Error running workflow';
+                stepOutputs.innerHTML += `<div class="error-message">Error: ${error.message || 'Unknown error occurred'}</div>`;
                 eventSource.close();
             };
         }
@@ -1117,10 +1245,15 @@ HTML = """
         });
 
         function saveWorkflow() {
+            const workflowData = {
+                ...currentWorkflow,
+                knowledge_structures: getSelectedKnowledgeStructures()
+            };
+
             fetch('/save-workflow', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(currentWorkflow)
+                body: JSON.stringify(workflowData)
             })
             .then(response => response.text())
             .then(text => {
@@ -1143,6 +1276,16 @@ HTML = """
                 console.error('Error saving workflow:', error);
                 alert(`Failed to save workflow. Error: ${error.message}`);
             });
+        }
+
+        function getSelectedKnowledgeStructures() {
+            const knowledgeStructureSelects = document.querySelectorAll('select[name^="knowledge_structure"]');
+            const selectedStructures = [];
+            knowledgeStructureSelects.forEach(select => {
+                const selectedOptions = Array.from(select.selectedOptions);
+                selectedStructures.push(...selectedOptions.map(option => option.value));
+            });
+            return selectedStructures;
         }
 
         function loadWorkflows() {
