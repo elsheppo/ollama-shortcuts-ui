@@ -46,6 +46,14 @@ The purpose of this project is to build a fully local workflow engine that allow
 4. **Form Builder**: Create custom input forms for your workflows.
 5. **Settings**: Configure Ollama API settings and other options.
 
+## Creating Workflows with Claude and the Executable Ontology
+
+Paste the Executable Ontology markdown file into Claude 3.5 Sonnet alongside a description of the workflow you want to design. Sometimes it may have an issue where it structures system prompts incorrectly with multi-line text. You can correct it by telling it to put the system prompt on a single line with no line breaks.
+
+The workflow you get with this will be a linear workflow (no branching / merging) that you can import in OSUI via "Import Workflow". Then you can run the workflow!
+
+Currently this executable ontology is designed to select from either gemma2:2b or llama3.1:latest from your available Ollama model files. If you don't have these models, or you want to change them, you can do this once the workflow is created based on your preferences.
+
 ## Contributing
 
 We welcome contributions to Ollama Shortcuts UI! Here's how you can help:
@@ -60,11 +68,13 @@ We welcome contributions to Ollama Shortcuts UI! Here's how you can help:
 
 While we can't include Apple Shortcuts directly in this repository due to their proprietary format, we've created some starting blocks for you. Download it from the following iCloud links:
 
-- [Ollama Shortcut, Block 1](https://www.icloud.com/shortcuts/26cc4ca06a4a4bb09537a438f0abc3e5): Make this the starting block in a workflow.
-- [Ollama Shortcut, Block N](https://www.icloud.com/shortcuts/c4efc7b0654d4cb88f0b8d754bdc1913): Extend workflows after Block 1 using this block for each step.
+- [OSUI, Block 1](https://www.icloud.com/shortcuts/26cc4ca06a4a4bb09537a438f0abc3e5): Make this the starting block in a workflow.
+- [OSUI, Block N](https://www.icloud.com/shortcuts/c4efc7b0654d4cb88f0b8d754bdc1913): Extend workflows after Block 1 using this block for each step.
+- [OSUI Function Router](https://www.icloud.com/shortcuts/1344e0d87a4e4df28a49e3e29f64869f): Demo function calling block that can run the "Get Weather" action when the user asks about the weather.
+- [OSUI Function – Get Weather](https://www.icloud.com/shortcuts/43763a5b6f90480d93f79c0ce789d34c): Gets the weather in Austin using Apple Weather. To get the weather in your locality, change the City in the shortcut itself.
 
-To use this Shortcut:
-1. Click on the links above on your Apple device
+To use these Shortcuts:
+1. Click on the links above on your Mac
 2. Add the Shortcut to your library
 3. In the Ollama Shortcuts UI web interface, refresh your Shortcuts list to see the new additions
 
